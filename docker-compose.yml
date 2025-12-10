@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: neto-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Isso garante que o banco de dados não suma se reiniciar o container
+      - ./backend/netobebidas.db:/app/netobebidas.db
+    restart: always
+
+  frontend:
+    build: ./frontend
+    container_name: neto-frontend
+    ports:
+      - "80:80" # O site vai rodar na porta 80 (padrão web)
+    depends_on:
+      - backend
+    restart: always
