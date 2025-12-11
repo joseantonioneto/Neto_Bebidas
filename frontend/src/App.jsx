@@ -6,21 +6,21 @@ import {
   IconButton, Select, MenuItem, FormControl, InputLabel, 
   Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
   Box, Snackbar, Alert, Tab, Tabs, TextField, Dialog, DialogTitle, 
-  DialogContent, DialogActions, Badge, Chip, InputAdornment
+  DialogContent, DialogActions, Badge, Chip, InputAdornment,
+  Autocomplete
 } from '@mui/material';
 
 import { 
-  ShoppingCart, AddCircle, Delete, PersonAdd, 
+  ShoppingCart, PersonAdd, 
   Inventory, Add, Assessment, AttachMoney, MoneyOff, 
-  Logout, Paid, LocalBar // <--- Ícone de Bebida importado aqui
+  Logout, Paid, LocalBar, Edit, Delete, Search 
 } from '@mui/icons-material';
 
 // --- Configuração da API ---
 const api = axios.create({
-  baseURL: 'http://ip:8000',
+  baseURL: 'http://localhost:8001',
 });
 
-// Interceptor para adicionar o Token em toda requisição
 api.interceptors.request.use((config) => {
     const token = localStorage.getItem('token');
     if (token) {
@@ -31,12 +31,10 @@ api.interceptors.request.use((config) => {
 
 
 function App() {
-  // --- Estados de Autenticação ---
   const [token, setToken] = useState(localStorage.getItem('token'));
   const [isLoginView, setIsLoginView] = useState(true); 
   const [authForm, setAuthForm] = useState({ username: '', password: '' });
 
-  // --- Estados do Sistema ---
   const [tabValue, setTabValue] = useState(0); 
   const [cart, setCart] = useState([]);
   const [products, setProducts] = useState([]);
@@ -44,18 +42,25 @@ function App() {
   const [salesHistory, setSalesHistory] = useState([]); 
   const [selectedCustomer, setSelectedCustomer] = useState('');
   
-  // --- Estados de Feedback e Dialogs ---
+  // --- Estados de Busca ---
+  const [searchTerm, setSearchTerm] = useState(''); // Busca Clientes
+  const [searchTermProduct, setSearchTermProduct] = useState(''); // Busca Produtos (Aba Vender)
+
   const [feedback, setFeedback] = useState({ open: false, message: '', severity: 'success' });
   const [openNewClientDialog, setOpenNewClientDialog] = useState(false);
   const [newClientName, setNewClientName] = useState('');
-  const [openProductDialog, setOpenProductDialog] = useState(false);
-  const [newProduct, setNewProduct] = useState({ name: '', cost_price: '', sell_price: '', stock: '' });
   
-  // Estado para Pagamento de Dívida
+  // Dialogs de Produto
+  const [openProductDialog, setOpenProductDialog] = useState(false);
+  const [openEditProductDialog, setOpenEditProductDialog] = useState(false);
+  
+  // States dos formulários
+  const [newProduct, setNewProduct] = useState({ name: '', cost_price: '', sell_price: '', stock: '' });
+  const [editProductData, setEditProductData] = useState({ id: null, name: '', cost_price: '', sell_price: '', stock: '' });
+  
   const [openPayDialog, setOpenPayDialog] = useState(false);
   const [payData, setPayData] = useState({ customerId: null, customerName: '', amount: '' });
 
-  // --- Efeito Inicial ---
   useEffect(() => {
     if (token) fetchData();
   }, [token]);
@@ -81,7 +86,6 @@ function App() {
     setFeedback({ open: true, message, severity });
   };
 
-  // --- AUTENTICAÇÃO ---
   const handleLogin = async () => {
       try {
           const formData = new FormData();
@@ -115,12 +119,28 @@ function App() {
       setCart([]);
   };
 
-  // --- CÁLCULOS DO DASHBOARD ---
+  // Cálculos Gerais
   const totalSold = salesHistory.reduce((acc, sale) => acc + sale.total_value, 0);
   const totalDebtCurrent = customers.reduce((acc, customer) => acc + customer.debt, 0);
   const totalCash = totalSold - totalDebtCurrent;
 
-  // --- Funcionalidades do Sistema ---
+  // --- FILTROS ---
+  
+  // 1. Filtro de Clientes (Aba Clientes) - Ordenado
+  const filteredCustomers = customers
+    .filter((customer) => 
+      customer.name.toLowerCase().includes(searchTerm.toLowerCase())
+    )
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  // 2. Filtro de Produtos (Aba Vender) - Ordenado
+  const filteredProducts = products
+    .filter((product) => 
+      product.name.toLowerCase().includes(searchTermProduct.toLowerCase())
+    )
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+
   const addToCart = (product) => {
     if (product.stock <= 0) return showFeedback('Produto sem estoque!', 'warning');
     const countInCart = cart.filter(p => p.id === product.id).length;
@@ -131,19 +151,19 @@ function App() {
   const removeFromCart = (cartId) => setCart(cart.filter(item => item.cartId !== cartId));
 
   const handleFinishSale = async (isPaid) => {
-    if (!selectedCustomer) return showFeedback('Selecione um cliente!', 'warning');
-    if (cart.length === 0) return showFeedback('Carrinho vazio!', 'warning');
-
-    try {
-      await api.post('/sales/', {
-        customer_id: parseInt(selectedCustomer),
-        product_ids: cart.map(p => p.id),
-        is_paid: isPaid
-      });
-      showFeedback(isPaid ? "Venda recebida!" : "Marcado como FIADO!", isPaid ? 'success' : 'info');
-      setCart([]); 
-      fetchData();
-    } catch (error) { showFeedback('Erro ao processar venda.', 'error'); }
+      if (!selectedCustomer) return showFeedback('Selecione um cliente!', 'warning');
+      if (cart.length === 0) return showFeedback('Carrinho vazio!', 'warning');
+  
+      try {
+        await api.post('/sales/', {
+          customer_id: parseInt(selectedCustomer),
+          product_ids: cart.map(p => p.id),
+          is_paid: isPaid
+        });
+        showFeedback(isPaid ? "Venda recebida!" : "Marcado como FIADO!", isPaid ? 'success' : 'info');
+        setCart([]); 
+        fetchData();
+      } catch (error) { showFeedback('Erro ao processar venda.', 'error'); }
   };
 
   const openPaymentModal = (customer) => {
@@ -165,25 +185,83 @@ function App() {
 
   const handleCreateCustomer = async () => {
     if(!newClientName) return;
-    await api.post('/customers/', { name: newClientName });
-    setOpenNewClientDialog(false); setNewClientName(''); fetchData();
+    try {
+      await api.post('/customers/', { name: newClientName });
+      showFeedback('Cliente cadastrado!', 'success');
+      setOpenNewClientDialog(false); 
+      setNewClientName(''); 
+      fetchData();
+    } catch (error) {
+      showFeedback('Erro ao criar cliente.', 'error');
+    }
   };
 
   const handleCreateProduct = async () => {
     if (!newProduct.name || !newProduct.sell_price) return showFeedback('Preencha os dados!', 'warning');
-    await api.post('/products/', {
-        name: newProduct.name, cost_price: parseFloat(newProduct.cost_price || 0),
-        sell_price: parseFloat(newProduct.sell_price), stock: parseInt(newProduct.stock || 0)
-    });
-    setOpenProductDialog(false); setNewProduct({ name: '', cost_price: '', sell_price: '', stock: '' }); fetchData();
+    try {
+      await api.post('/products/', {
+          name: newProduct.name, 
+          cost_price: parseFloat(newProduct.cost_price || 0),
+          sell_price: parseFloat(newProduct.sell_price), 
+          stock: parseInt(newProduct.stock || 0)
+      });
+      showFeedback('Salvo com sucesso!', 'success');
+      setOpenProductDialog(false); 
+      setNewProduct({ name: '', cost_price: '', sell_price: '', stock: '' }); 
+      fetchData();
+    } catch (error) {
+      showFeedback('Erro ao salvar produto.', 'error');
+    }
   };
 
-  // --- TELA DE LOGIN ---
+  const handleOpenEdit = (product) => {
+      setEditProductData({ 
+          id: product.id, 
+          name: product.name, 
+          cost_price: product.cost_price, 
+          sell_price: product.sell_price, 
+          stock: product.stock 
+      });
+      setOpenEditProductDialog(true);
+  };
+
+  const handleSaveEdit = async () => {
+      try {
+          await api.put(`/products/${editProductData.id}`, {
+              name: editProductData.name,
+              cost_price: parseFloat(editProductData.cost_price),
+              sell_price: parseFloat(editProductData.sell_price),
+              stock: parseInt(editProductData.stock)
+          });
+          showFeedback('Produto atualizado!', 'success');
+          setOpenEditProductDialog(false);
+          fetchData();
+      } catch (error) {
+          showFeedback('Erro ao atualizar.', 'error');
+      }
+  };
+
+  const handleProductSelect = (event, value) => {
+    if (value) {
+        const existing = products.find(p => p.name === value);
+        if (existing) {
+            setNewProduct({
+                ...newProduct,
+                name: existing.name,
+                sell_price: existing.sell_price,
+                cost_price: '', 
+                stock: ''
+            });
+        } else {
+            setNewProduct({ ...newProduct, name: value });
+        }
+    }
+  };
+
   if (!token) {
       return (
           <Box display="flex" justifyContent="center" alignItems="center" minHeight="100vh" bgcolor="#f5f5f5">
               <Paper elevation={6} sx={{ p: 5, width: 380, textAlign: 'center', borderRadius: 4 }}>
-                  {/* ÍCONE E TÍTULO PERSONALIZADO */}
                   <Box sx={{ mb: 2, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 1 }}>
                     <LocalBar sx={{ fontSize: 50, color: '#1a237e' }} />
                   </Box>
@@ -226,7 +304,6 @@ function App() {
       );
   }
 
-  // --- TELA PRINCIPAL (DASHBOARD) ---
   return (
     <Box sx={{ flexGrow: 1, bgcolor: '#f0f2f5', minHeight: '100vh', pb: 5 }}>
       <AppBar position="static" sx={{ bgcolor: '#1a237e' }}>
@@ -299,8 +376,21 @@ function App() {
         {tabValue === 1 && (
           <Grid container spacing={3}>
             <Grid item xs={12} md={8}>
+              
+              {/* --- CAMPO DE BUSCA DE PRODUTOS --- */}
+              <Paper sx={{ p: 2, mb: 2, display: 'flex', alignItems: 'center' }}>
+                  <Search sx={{ color: 'action.active', mr: 1, my: 0.5 }} />
+                  <TextField 
+                      fullWidth 
+                      variant="standard" 
+                      placeholder="Pesquisar produto para vender..." 
+                      value={searchTermProduct}
+                      onChange={(e) => setSearchTermProduct(e.target.value)}
+                  />
+              </Paper>
+
               <Grid container spacing={2}>
-                {products.map((product) => (
+                {filteredProducts.map((product) => (
                   <Grid item xs={6} sm={4} md={3} key={product.id}>
                     <Card sx={{ height: '100%', display: 'flex', flexDirection: 'column', opacity: product.stock > 0 ? 1 : 0.6 }}>
                       <CardContent sx={{ flexGrow: 1, p: 1 }}>
@@ -312,17 +402,33 @@ function App() {
                     </Card>
                   </Grid>
                 ))}
+                {filteredProducts.length === 0 && (
+                    <Grid item xs={12}>
+                        <Typography variant="body1" align="center" color="textSecondary" sx={{ mt: 4 }}>
+                            Nenhum produto encontrado.
+                        </Typography>
+                    </Grid>
+                )}
               </Grid>
             </Grid>
+            
+            {/* --- CARRINHO / SELEÇÃO DE CLIENTE COM AUTOCOMPLETE --- */}
             <Grid item xs={12} md={4}>
               <Paper sx={{ p: 2, position: 'sticky', top: 20 }}>
                 <Typography variant="h6" gutterBottom><ShoppingCart/> Carrinho</Typography>
-                <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-                  <InputLabel>Cliente</InputLabel>
-                  <Select value={selectedCustomer} label="Cliente" onChange={(e) => setSelectedCustomer(e.target.value)}>
-                    {customers.map((c) => <MenuItem key={c.id} value={c.id}>{c.name}</MenuItem>)}
-                  </Select>
-                </FormControl>
+                
+                {/* CAMPO DE SELEÇÃO DE CLIENTE (AGORA PESQUISÁVEL) */}
+                <Autocomplete
+                    options={customers.sort((a, b) => a.name.localeCompare(b.name))} // Ordena de A-Z
+                    getOptionLabel={(option) => option.name}
+                    value={customers.find(c => c.id === selectedCustomer) || null}
+                    onChange={(event, newValue) => {
+                        setSelectedCustomer(newValue ? newValue.id : '');
+                    }}
+                    renderInput={(params) => <TextField {...params} label="Selecione o Cliente" variant="outlined" size="small" />}
+                    sx={{ mb: 2 }}
+                />
+
                 <List dense sx={{ maxHeight: 200, overflow: 'auto', bgcolor: '#fafafa', mb: 2 }}>
                     {cart.map((item) => (
                         <ListItem key={item.cartId} secondaryAction={<IconButton size="small" onClick={() => removeFromCart(item.cartId)} color="error"><Delete/></IconButton>}>
@@ -342,30 +448,51 @@ function App() {
           </Grid>
         )}
 
-        {/* === CLIENTES === */}
+        {/* === CLIENTES (ATUALIZADO COM BUSCA) === */}
         {tabValue === 2 && (
           <Container maxWidth="md">
-            <Box display="flex" justifyContent="space-between" mb={3}>
+            <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
                 <Typography variant="h5">Gerenciar Clientes</Typography>
                 <Button variant="contained" onClick={() => setOpenNewClientDialog(true)} startIcon={<PersonAdd/>}>Novo</Button>
             </Box>
+            
+            {/* --- CAMPO DE BUSCA DE CLIENTES --- */}
+            <Paper sx={{ p: 2, mb: 2, display: 'flex', alignItems: 'center' }}>
+                <Search sx={{ color: 'action.active', mr: 1, my: 0.5 }} />
+                <TextField 
+                    fullWidth 
+                    variant="standard" 
+                    placeholder="Pesquisar cliente por nome..." 
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                />
+            </Paper>
+
             <TableContainer component={Paper}>
               <Table>
                 <TableHead sx={{ bgcolor: '#eee' }}><TableRow><TableCell>Nome</TableCell><TableCell align="right">Dívida Atual (R$)</TableCell><TableCell align="center">Ação</TableCell></TableRow></TableHead>
                 <TableBody>
-                  {customers.map((row) => (
-                    <TableRow key={row.id}>
-                      <TableCell>{row.name}</TableCell>
-                      <TableCell align="right" sx={{ fontWeight: 'bold', color: row.debt > 0 ? 'red' : 'green' }}>R$ {row.debt.toFixed(2)}</TableCell>
-                      <TableCell align="center">
-                          {row.debt > 0 ? (
-                              <Button size="small" variant="outlined" color="success" startIcon={<Paid/>} onClick={() => openPaymentModal(row)}>
-                                  Pagar
-                              </Button>
-                          ) : <Chip label="Quitado" color="success" size="small" variant="outlined"/>}
-                      </TableCell>
+                  {filteredCustomers.length > 0 ? (
+                    filteredCustomers.map((row) => (
+                      <TableRow key={row.id}>
+                        <TableCell>{row.name}</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: 'bold', color: row.debt > 0 ? 'red' : 'green' }}>R$ {row.debt.toFixed(2)}</TableCell>
+                        <TableCell align="center">
+                            {row.debt > 0 ? (
+                                <Button size="small" variant="outlined" color="success" startIcon={<Paid/>} onClick={() => openPaymentModal(row)}>
+                                    Pagar
+                                </Button>
+                            ) : <Chip label="Quitado" color="success" size="small" variant="outlined"/>}
+                        </TableCell>
+                      </TableRow>
+                    ))
+                  ) : (
+                    <TableRow>
+                        <TableCell colSpan={3} align="center" sx={{ py: 3, fontStyle: 'italic', color: 'gray' }}>
+                            Nenhum cliente encontrado.
+                        </TableCell>
                     </TableRow>
-                  ))}
+                  )}
                 </TableBody>
               </Table>
             </TableContainer>
@@ -377,18 +504,30 @@ function App() {
             <Container maxWidth="lg">
                 <Box display="flex" justifyContent="space-between" mb={3}>
                     <Typography variant="h5">Estoque</Typography>
-                    <Button variant="contained" onClick={() => setOpenProductDialog(true)} startIcon={<Add/>}>Adicionar</Button>
+                    <Button variant="contained" onClick={() => setOpenProductDialog(true)} startIcon={<Add/>}>Adicionar / Abastecer</Button>
                 </Box>
                 <TableContainer component={Paper}>
                     <Table size="small">
                         <TableHead sx={{ bgcolor: '#eee' }}>
-                            <TableRow><TableCell>Produto</TableCell><TableCell align="right">Custo</TableCell><TableCell align="right">Venda</TableCell><TableCell align="center">Qtd</TableCell></TableRow>
+                            <TableRow>
+                                <TableCell>Produto</TableCell>
+                                <TableCell align="right">Custo Médio</TableCell>
+                                <TableCell align="right">Venda</TableCell>
+                                <TableCell align="center">Qtd</TableCell>
+                                <TableCell align="center">Ações</TableCell>
+                            </TableRow>
                         </TableHead>
                         <TableBody>
                             {products.map((p) => (
                                 <TableRow key={p.id}>
-                                    <TableCell>{p.name}</TableCell><TableCell align="right">{p.cost_price.toFixed(2)}</TableCell><TableCell align="right">{p.sell_price.toFixed(2)}</TableCell>
+                                    <TableCell>{p.name}</TableCell>
+                                    <TableCell align="right">{p.cost_price.toFixed(2)}</TableCell>
+                                    <TableCell align="right">{p.sell_price.toFixed(2)}</TableCell>
                                     <TableCell align="center"><Badge color={p.stock < 5 ? "error" : "primary"} badgeContent={p.stock} showZero><Inventory color="action"/></Badge></TableCell>
+                                    <TableCell align="center">
+                                        <IconButton size="small" onClick={() => handleOpenEdit(p)} color="primary"><Edit /></IconButton>
+                                        <IconButton size="small" color="error" disabled><Delete /></IconButton>
+                                    </TableCell>
                                 </TableRow>
                             ))}
                         </TableBody>
@@ -407,21 +546,96 @@ function App() {
         <DialogActions><Button onClick={() => setOpenNewClientDialog(false)}>Cancelar</Button><Button onClick={handleCreateCustomer}>Salvar</Button></DialogActions>
       </Dialog>
 
-      {/* 2. Novo Produto */}
-      <Dialog open={openProductDialog} onClose={() => setOpenProductDialog(false)}>
-        <DialogTitle>Novo Produto</DialogTitle>
-        <DialogContent>
-            <TextField margin="dense" label="Nome" fullWidth value={newProduct.name} onChange={(e) => setNewProduct({...newProduct, name: e.target.value})} />
-            <Box display="flex" gap={2} mt={1}>
-                <TextField label="Custo" type="number" fullWidth value={newProduct.cost_price} onChange={(e) => setNewProduct({...newProduct, cost_price: e.target.value})} />
-                <TextField label="Venda" type="number" fullWidth value={newProduct.sell_price} onChange={(e) => setNewProduct({...newProduct, sell_price: e.target.value})} />
+      {/* 2. Novo Produto / Abastecer */}
+      <Dialog open={openProductDialog} onClose={() => setOpenProductDialog(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Novo Produto ou Abastecimento</DialogTitle>
+        <DialogContent sx={{ pt: 2 }}>
+            <Box mb={2}>
+              <Autocomplete
+                freeSolo
+                options={products.map((option) => option.name)}
+                value={newProduct.name}
+                onInputChange={(event, newInputValue) => {
+                    setNewProduct(prev => ({ ...prev, name: newInputValue }));
+                }}
+                onChange={(event, newValue) => handleProductSelect(event, newValue)}
+                renderInput={(params) => (
+                  <TextField 
+                    {...params} 
+                    label="Nome do Produto" 
+                    placeholder="Selecione ou digite um novo..." 
+                    helperText="Se selecionar um existente, será considerado um abastecimento."
+                    fullWidth 
+                  />
+                )}
+              />
             </Box>
-            <TextField margin="dense" label="Estoque" type="number" fullWidth sx={{mt:2}} value={newProduct.stock} onChange={(e) => setNewProduct({...newProduct, stock: e.target.value})} />
+
+            <Box display="flex" gap={2} mt={1}>
+                <TextField 
+                    label="Custo (Deste Lote)" 
+                    type="number" 
+                    fullWidth 
+                    value={newProduct.cost_price} 
+                    onChange={(e) => setNewProduct({...newProduct, cost_price: e.target.value})} 
+                    helperText="Informe o custo unitário desta nova compra."
+                />
+                <TextField 
+                    label="Venda (Atualizar)" 
+                    type="number" 
+                    fullWidth 
+                    value={newProduct.sell_price} 
+                    onChange={(e) => setNewProduct({...newProduct, sell_price: e.target.value})} 
+                />
+            </Box>
+            <TextField 
+                margin="dense" 
+                label="Quantidade (Adicionar)" 
+                type="number" 
+                fullWidth 
+                sx={{mt:2}} 
+                value={newProduct.stock} 
+                onChange={(e) => setNewProduct({...newProduct, stock: e.target.value})} 
+            />
         </DialogContent>
-        <DialogActions><Button onClick={() => setOpenProductDialog(false)}>Cancelar</Button><Button onClick={handleCreateProduct}>Salvar</Button></DialogActions>
+        <DialogActions><Button onClick={() => setOpenProductDialog(false)}>Cancelar</Button><Button onClick={handleCreateProduct} variant="contained">Salvar</Button></DialogActions>
       </Dialog>
 
-      {/* 3. Pagar Dívida */}
+      {/* 3. Editar Produto */}
+      <Dialog open={openEditProductDialog} onClose={() => setOpenEditProductDialog(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Editar Produto</DialogTitle>
+        <DialogContent sx={{ pt: 2 }}>
+            <TextField 
+                margin="dense" label="Nome" fullWidth 
+                value={editProductData.name} 
+                onChange={(e) => setEditProductData({...editProductData, name: e.target.value})} 
+            />
+            <Box display="flex" gap={2} mt={1}>
+                <TextField 
+                    label="Custo Médio" type="number" fullWidth 
+                    value={editProductData.cost_price} 
+                    onChange={(e) => setEditProductData({...editProductData, cost_price: e.target.value})} 
+                />
+                <TextField 
+                    label="Venda" type="number" fullWidth 
+                    value={editProductData.sell_price} 
+                    onChange={(e) => setEditProductData({...editProductData, sell_price: e.target.value})} 
+                />
+            </Box>
+            <TextField 
+                margin="dense" label="Estoque Atual (Correção)" type="number" fullWidth sx={{mt:2}}
+                value={editProductData.stock} 
+                onChange={(e) => setEditProductData({...editProductData, stock: e.target.value})} 
+                helperText="Cuidado: isso altera diretamente a quantidade."
+            />
+        </DialogContent>
+        <DialogActions>
+            <Button onClick={() => setOpenEditProductDialog(false)}>Cancelar</Button>
+            <Button onClick={handleSaveEdit} variant="contained" color="primary">Salvar Alterações</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 4. Pagar Dívida */}
       <Dialog open={openPayDialog} onClose={() => setOpenPayDialog(false)}>
           <DialogTitle>Quitar Dívida - {payData.customerName}</DialogTitle>
           <DialogContent>

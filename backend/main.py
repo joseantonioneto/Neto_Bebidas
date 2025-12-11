@@ -79,6 +79,13 @@ class ProductCreate(BaseModel):
     sell_price: float
     stock: int
 
+# Schema para Atualização (Edição)
+class ProductUpdate(BaseModel):
+    name: Optional[str] = None
+    cost_price: Optional[float] = None
+    sell_price: Optional[float] = None
+    stock: Optional[int] = None
+
 class CustomerCreate(BaseModel):
     name: str
 
@@ -163,13 +170,61 @@ def read_products(db: Session = Depends(get_db), current_user: User = Depends(ge
 
 @app.post("/products/")
 def create_product(product: ProductCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    db_product = Product(
-        name=product.name, 
-        cost_price=product.cost_price, 
-        sell_price=product.sell_price, 
-        stock=product.stock
-    )
-    db.add(db_product)
+    product_name = product.name.strip()
+    existing_product = db.query(Product).filter(Product.name == product_name).first()
+
+    if existing_product:
+        # --- MODO ABASTECIMENTO (UPDATE INTELIGENTE) ---
+        current_stock = max(existing_product.stock, 0)
+        current_cost = existing_product.cost_price
+        
+        new_stock_added = product.stock
+        new_cost = product.cost_price
+        
+        total_new_stock = current_stock + new_stock_added
+        
+        if total_new_stock > 0:
+            total_value = (current_stock * current_cost) + (new_stock_added * new_cost)
+            average_cost = total_value / total_new_stock
+            existing_product.cost_price = round(average_cost, 2)
+        else:
+            existing_product.cost_price = new_cost
+
+        existing_product.stock += new_stock_added
+        existing_product.sell_price = product.sell_price
+        
+        db.commit()
+        db.refresh(existing_product)
+        return existing_product
+    else:
+        # --- MODO CRIAÇÃO ---
+        db_product = Product(
+            name=product_name, 
+            cost_price=product.cost_price, 
+            sell_price=product.sell_price, 
+            stock=product.stock
+        )
+        db.add(db_product)
+        db.commit()
+        db.refresh(db_product)
+        return db_product
+
+# ROTA NOVA: Editar Produto (Para correções manuais)
+@app.put("/products/{product_id}")
+def update_product(product_id: int, product: ProductUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    db_product = db.query(Product).filter(Product.id == product_id).first()
+    if not db_product:
+        raise HTTPException(status_code=404, detail="Produto não encontrado")
+    
+    if product.name is not None:
+        db_product.name = product.name
+    if product.cost_price is not None:
+        db_product.cost_price = product.cost_price
+    if product.sell_price is not None:
+        db_product.sell_price = product.sell_price
+    if product.stock is not None:
+        db_product.stock = product.stock
+        
     db.commit()
     db.refresh(db_product)
     return db_product
@@ -186,7 +241,6 @@ def create_customer(customer: CustomerCreate, db: Session = Depends(get_db), cur
     db.commit()
     return db_customer
 
-# --- NOVA ROTA: PAGAR DÍVIDA (DAR BAIXA) ---
 @app.post("/customers/{customer_id}/pay/")
 def pay_customer_debt(customer_id: int, payment: DebtPayment, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
@@ -196,12 +250,7 @@ def pay_customer_debt(customer_id: int, payment: DebtPayment, db: Session = Depe
     if payment.amount <= 0:
          raise HTTPException(status_code=400, detail="Valor deve ser positivo")
 
-    # Diminui a dívida
     customer.debt -= payment.amount
-    
-    # Se quiser permitir que fique negativo (crédito), ok. Se não, pode travar aqui.
-    # Por enquanto vamos deixar livre (matemática simples).
-    
     db.commit()
     db.refresh(customer)
     return {"message": "Pagamento registrado", "new_debt": customer.debt, "customer": customer.name}
@@ -209,7 +258,6 @@ def pay_customer_debt(customer_id: int, payment: DebtPayment, db: Session = Depe
 # Vendas
 @app.get("/sales/")
 def list_sales(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # Traz histórico ordenado por data (mais novo primeiro)
     return db.query(Sale).options(joinedload(Sale.customer)).order_by(Sale.created_at.desc()).all()
 
 @app.post("/sales/")
@@ -236,7 +284,6 @@ def create_sale(sale: SaleCreate, db: Session = Depends(get_db), current_user: U
     db.commit()
     return {"message": "Venda realizada"}
 
-# Inicialização direta
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

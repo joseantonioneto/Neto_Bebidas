@@ -5,17 +5,16 @@ services:
     build: ./backend
     container_name: neto-backend
     ports:
-      - "8000:8000"
+      - "8001:8001" # <--- CORREÇÃO: Porta Externa 8001 >>> Porta Interna 8001
     volumes:
-      # Isso garante que o banco de dados não suma se reiniciar o container
-      - ./backend/netobebidas.db:/app/netobebidas.db
+      - ./backend:/app
     restart: always
 
   frontend:
     build: ./frontend
     container_name: neto-frontend
     ports:
-      - "80:80" # O site vai rodar na porta 80 (padrão web)
+      - "80:80"
     depends_on:
       - backend
     restart: always
