@@ -1,0 +1,20 @@
+{
+  "name": "Mercadinho Caminhar",
+  "short_name": "Caminhar",
+  "description": "Sistema de vendas, estoque e fechamento do Mercadinho Caminhar.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f0f2f5",
+  "theme_color": "#1a237e",
+  "orientation": "portrait-primary",
+  "categories": ["business", "productivity"],
+  "icons": [
+    {
+      "src": "/pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
