@@ -357,6 +357,33 @@ def migrate_schema():
 migrate_schema()
 
 
+DEFAULT_CUSTOMER_NAME = "Consumidor Final"
+
+
+def seed_defaults():
+    db = SessionLocal()
+    try:
+        if db.query(User).count() == 0:
+            admin_password = os.getenv("ADMIN_PASSWORD", "caminhar2026")
+            db.add(User(
+                username=os.getenv("ADMIN_USERNAME", "admin"),
+                hashed_password=pwd_context.hash(admin_password),
+                role=ADMIN_ROLE
+            ))
+            print(f"[seed] Usuário admin criado (senha padrão: {admin_password} — altere após o primeiro login)")
+
+        if not db.query(Customer).filter(Customer.name == DEFAULT_CUSTOMER_NAME).first():
+            db.add(Customer(name=DEFAULT_CUSTOMER_NAME, group_name="Caminhar Cristo Rei"))
+            print(f"[seed] Cliente padrão '{DEFAULT_CUSTOMER_NAME}' criado")
+
+        db.commit()
+    finally:
+        db.close()
+
+
+seed_defaults()
+
+
 def require_admin(u: User = Depends(get_current_user)):
     if u.role != ADMIN_ROLE:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Apenas administrador")
@@ -557,6 +584,16 @@ def generate_qr_for_product(id: int, db: Session = Depends(get_db), u: User = De
     db_p.barcode = code
     db.commit()
     return {"barcode": code, "generated": True}
+
+@app.post("/products/generate-qrcode-all")
+def generate_qr_for_all_products(db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    pending = db.query(Product).filter((Product.barcode == None) | (Product.barcode == "")).all()
+    generated = []
+    for p in pending:
+        p.barcode = f"MC-{p.id:05d}"
+        generated.append({"id": p.id, "name": p.name, "barcode": p.barcode})
+    db.commit()
+    return {"message": f"{len(generated)} códigos gerados", "generated": generated}
 
 @app.post("/products/bulk")
 def bulk_create_products(data: BulkProductCreate, db: Session = Depends(get_db), u: User = Depends(require_admin)):
@@ -805,6 +842,8 @@ def create_sale(sale: SaleCreate, db: Session = Depends(get_db), u: User = Depen
     cust = db.query(Customer).filter(Customer.id == sale.customer_id).first()
     if not cust:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    if not is_paid and cust.name == DEFAULT_CUSTOMER_NAME:
+        raise HTTPException(status_code=400, detail="Fiado exige um cliente identificado. Selecione ou cadastre o cliente.")
 
     if sale.items:
         product_counts = Counter()

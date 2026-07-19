@@ -19,6 +19,7 @@ import {
   CameraAlt, UploadFile, Close, People, CloudUpload
 } from '@mui/icons-material';
 
+import QRCode from 'qrcode';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
 import { format, subDays, parseISO, isAfter } from 'date-fns';
 
@@ -146,7 +147,10 @@ function App() {
   const [userForm, setUserForm] = useState({ username: '', password: '', role: 'vendedor' });
 
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [scanTarget, setScanTarget] = useState('sale'); // 'sale' | 'newProduct' | 'editProduct'
   const [cartOpen, setCartOpen] = useState(false);
+  const [qrPrintDialog, setQrPrintDialog] = useState(false);
+  const [qrPrintOnlyGenerated, setQrPrintOnlyGenerated] = useState(true);
 
   const [importClientsDialog, setImportClientsDialog] = useState(false);
   const [importNfeDialog, setImportNfeDialog] = useState(false);
@@ -178,6 +182,11 @@ function App() {
       ]);
       setProducts(prodRes.data);
       setCustomers(custRes.data);
+      setSelectedCustomer(prev => {
+        if (prev) return prev;
+        const defaultCustomer = custRes.data.find(c => c.name === 'Consumidor Final');
+        return defaultCustomer ? defaultCustomer.id : prev;
+      });
       setPaymentMethods(methodsRes.data);
       setPagBankStatus(pagBankRes.data);
 
@@ -221,6 +230,16 @@ function App() {
 
   // --- SCANNER ---
   const handleBarcodeScan = useCallback(async (code) => {
+    if (scanTarget === 'newProduct') {
+      setNewProduct(prev => ({ ...prev, barcode: code }));
+      showFeedback(`Código lido: ${code}`, 'info');
+      return;
+    }
+    if (scanTarget === 'editProduct') {
+      setEditProductData(prev => ({ ...prev, barcode: code }));
+      showFeedback(`Código lido: ${code}`, 'info');
+      return;
+    }
     try {
       const res = await api.get(`/products/barcode/${encodeURIComponent(code)}`);
       const product = res.data;
@@ -229,7 +248,12 @@ function App() {
     } catch {
       showFeedback(`Produto não encontrado: ${code}`, 'warning');
     }
-  }, []);
+  }, [scanTarget]);
+
+  const openScanner = (target) => {
+    setScanTarget(target);
+    setScannerOpen(true);
+  };
 
   // --- CALCULOS ---
   const stockMetrics = useMemo(() => {
@@ -275,18 +299,43 @@ function App() {
   const categoryOptions = [...new Set(products.map((p) => p.category || 'Geral'))].sort();
 
   const filteredCustomers = customers.filter(c => c.name.toLowerCase().includes(searchTerm.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name));
-  const filteredProducts = products.filter(p => p.name.toLowerCase().includes(searchTermProduct.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name));
+  const filteredProducts = products.filter(p => {
+    const term = searchTermProduct.trim().toLowerCase();
+    if (!term) return true;
+    return p.name.toLowerCase().includes(term) || (p.barcode || '').toLowerCase() === term;
+  }).sort((a, b) => a.name.localeCompare(b.name));
+
+  // Leitor USB no notebook: o leitor "digita" o código e envia Enter
+  const handleSearchEnter = (e) => {
+    if (e.key !== 'Enter') return;
+    const term = searchTermProduct.trim();
+    if (!term) return;
+    const exact = products.find(p => (p.barcode || '').toLowerCase() === term.toLowerCase());
+    if (exact) {
+      addToCart(exact);
+      showFeedback(`${exact.name} adicionado!`, 'success');
+      setSearchTermProduct('');
+    } else if (filteredProducts.length === 1) {
+      addToCart(filteredProducts[0]);
+      showFeedback(`${filteredProducts[0].name} adicionado!`, 'success');
+      setSearchTermProduct('');
+    }
+  };
 
   // --- ACOES ---
   const addToCart = (p) => {
     if (p.stock <= 0) return showFeedback('Sem estoque!', 'warning');
-    const existing = cart.find((item) => item.id === p.id);
-    if (existing) {
-      if (existing.quantity >= p.stock) return showFeedback('Quantidade máxima em estoque!', 'warning');
-      setCart(cart.map((item) => item.id === p.id ? { ...item, quantity: item.quantity + 1 } : item));
-      return;
-    }
-    setCart([...cart, { ...p, quantity: 1 }]);
+    setCart(prev => {
+      const existing = prev.find((item) => item.id === p.id);
+      if (existing) {
+        if (existing.quantity >= p.stock) {
+          showFeedback('Quantidade máxima em estoque!', 'warning');
+          return prev;
+        }
+        return prev.map((item) => item.id === p.id ? { ...item, quantity: item.quantity + 1 } : item);
+      }
+      return [...prev, { ...p, quantity: 1 }];
+    });
   };
 
   const updateCartQuantity = (productId, quantity) => {
@@ -304,8 +353,12 @@ function App() {
   const handleFinishSale = async (isPaid) => {
     if (!selectedCustomer) return showFeedback('Selecione cliente!', 'warning');
     if (cart.length === 0) return showFeedback('Carrinho vazio!', 'warning');
+    const paymentMethod = isPaid ? selectedPaymentMethod : 'fiado';
+    const selectedCustomerObj = customers.find(c => c.id === parseInt(selectedCustomer));
+    if (paymentMethod === 'fiado' && selectedCustomerObj?.name === 'Consumidor Final') {
+      return showFeedback('Fiado exige cliente identificado. Selecione ou cadastre o cliente.', 'warning');
+    }
     try {
-      const paymentMethod = isPaid ? selectedPaymentMethod : 'fiado';
       const items = cart.map((p) => ({ product_id: p.id, quantity: p.quantity }));
       if (paymentMethod === 'pagbank') {
         await api.post('/integrations/pagbank/payment-intents', {
@@ -373,6 +426,75 @@ function App() {
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro ao editar produto', 'error');
     }
+  };
+
+  const handleGenerateQRAll = async () => {
+    try {
+      const res = await api.post('/products/generate-qrcode-all');
+      showFeedback(res.data.message, 'success');
+      fetchData();
+    } catch {
+      showFeedback('Erro ao gerar códigos', 'error');
+    }
+  };
+
+  const handlePrintQrLabels = async () => {
+    const list = products
+      .filter(p => p.barcode && (!qrPrintOnlyGenerated || p.barcode.startsWith('MC-')))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (!list.length) return showFeedback('Nenhum produto com código para imprimir. Gere os códigos primeiro.', 'warning');
+
+    const labels = await Promise.all(list.map(async (p) => ({
+      name: p.name,
+      barcode: p.barcode,
+      price: formatCurrency(p.sell_price),
+      qr: await QRCode.toDataURL(p.barcode, { width: 220, margin: 1 })
+    })));
+
+    const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Etiquetas QR - Mercadinho Caminhar</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, sans-serif; padding: 5mm; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4mm; }
+  .label { border: 1px dashed #999; padding: 3mm; text-align: center; page-break-inside: avoid; }
+  .label .name { font-size: 11px; font-weight: bold; min-height: 26px; overflow: hidden; }
+  .label .price { font-size: 13px; font-weight: bold; margin: 1mm 0; }
+  .label img { width: 30mm; height: 30mm; }
+  .label .code { font-size: 10px; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+<div class="grid">
+${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</div><div class="price">R$ ${l.price}</div><img src="${l.qr}" alt="${l.barcode}"><div class="code">${l.barcode}</div></div>`).join('\n')}
+</div>
+</body>
+</html>`;
+
+    // Iframe oculto: imprime sem depender de pop-up (bloqueado por padrão em tablets)
+    const oldFrame = document.getElementById('qr-print-frame');
+    if (oldFrame) oldFrame.remove();
+    const frame = document.createElement('iframe');
+    frame.id = 'qr-print-frame';
+    frame.style.position = 'fixed';
+    frame.style.right = '0';
+    frame.style.bottom = '0';
+    frame.style.width = '0';
+    frame.style.height = '0';
+    frame.style.border = '0';
+    document.body.appendChild(frame);
+    frame.srcdoc = html;
+    frame.onload = () => {
+      setTimeout(() => {
+        frame.contentWindow.focus();
+        frame.contentWindow.print();
+      }, 300);
+    };
+    showFeedback(`Preparando ${labels.length} etiquetas para impressão...`, 'info');
+    setQrPrintDialog(false);
   };
 
   const handleGenerateQR = async (productId) => {
@@ -506,14 +628,7 @@ function App() {
     }
   };
 
-  const handleScanForProduct = () => {
-    setScannerOpen(true);
-  };
-
-  const handleScanForNewProduct = useCallback((code) => {
-    setNewProduct(prev => ({ ...prev, barcode: code }));
-    showFeedback(`Código lido: ${code}`, 'info');
-  }, []);
+  const handleScanForProduct = () => openScanner('sale');
 
   // --- TELA DE LOGIN ---
   if (!token) {
@@ -550,7 +665,7 @@ function App() {
   const CartContent = () => (
     <Box sx={{ p: 2, width: isMobile ? '100vw' : 'auto', maxWidth: 400 }}>
       <Typography variant="h6" gutterBottom><ShoppingCart /> Carrinho ({cart.length})</Typography>
-      <Autocomplete options={customers} getOptionLabel={(o) => o.name} onChange={(e, v) => setSelectedCustomer(v ? v.id : '')} renderInput={(params) => <TextField {...params} label="Cliente" size="small" />} sx={{ mb: 2 }} />
+      <Autocomplete options={customers} getOptionLabel={(o) => o.name} value={customers.find(c => c.id === selectedCustomer) || null} isOptionEqualToValue={(o, v) => o.id === v.id} onChange={(e, v) => setSelectedCustomer(v ? v.id : '')} renderInput={(params) => <TextField {...params} label="Cliente" size="small" />} sx={{ mb: 2 }} />
       <FormControl size="small" fullWidth sx={{ mb: 2 }}>
         <InputLabel>Pagamento</InputLabel>
         <Select label="Pagamento" value={selectedPaymentMethod} onChange={(e) => setSelectedPaymentMethod(e.target.value)}>
@@ -731,7 +846,7 @@ function App() {
             <Grid item xs={12} md={8}>
               <Paper sx={{ p: 2, mb: 2 }}>
                 <Box display="flex" gap={1} alignItems="center">
-                  <TextField fullWidth variant="standard" placeholder="Buscar produto..." value={searchTermProduct} onChange={(e) => setSearchTermProduct(e.target.value)} InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }} />
+                  <TextField fullWidth variant="standard" placeholder="Buscar produto ou bipar código..." value={searchTermProduct} onChange={(e) => setSearchTermProduct(e.target.value)} onKeyDown={handleSearchEnter} InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }} />
                   <IconButton color="primary" onClick={handleScanForProduct} sx={{ bgcolor: '#e8eaf6', '&:hover': { bgcolor: '#c5cae9' } }}>
                     <QrCodeScanner />
                   </IconButton>
@@ -829,7 +944,12 @@ function App() {
           <Container maxWidth="lg">
             <Box display="flex" justifyContent="space-between" mb={3} flexWrap="wrap" gap={1}>
               <Typography variant="h5">Estoque</Typography>
-              <Box display="flex" gap={1}>
+              <Box display="flex" gap={1} flexWrap="wrap">
+                {isAdmin && (
+                  <Button variant="outlined" color="secondary" onClick={() => setQrPrintDialog(true)} startIcon={<QrCodeScanner />} size={isMobile ? "small" : "medium"}>
+                    Etiquetas QR
+                  </Button>
+                )}
                 {isAdmin && (
                   <Button variant="outlined" onClick={() => setImportNfeDialog(true)} startIcon={<UploadFile />} size={isMobile ? "small" : "medium"}>
                     Importar NF-e
@@ -1028,6 +1148,29 @@ function App() {
         </DialogActions>
       </Dialog>
 
+      {/* Etiquetas QR */}
+      <Dialog open={qrPrintDialog} onClose={() => setQrPrintDialog(false)} fullWidth maxWidth="sm">
+        <DialogTitle>Etiquetas QR Code</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            1. Gere códigos únicos (MC-xxxxx) para os produtos que ainda não têm código de barras.<br />
+            2. Imprima a folha de etiquetas e cole nos produtos.<br />
+            No caixa, o scanner (câmera ou leitor USB) lê tanto o QR quanto o código de barras original.
+          </Typography>
+          <Button fullWidth variant="outlined" sx={{ mb: 2 }} onClick={handleGenerateQRAll} startIcon={<QrCodeScanner />}>
+            Gerar códigos para produtos sem código ({products.filter(p => !p.barcode).length} pendentes)
+          </Button>
+          <FormControlLabel
+            control={<Switch checked={qrPrintOnlyGenerated} onChange={(e) => setQrPrintOnlyGenerated(e.target.checked)} />}
+            label="Imprimir somente códigos gerados (MC-). Desligue para incluir produtos com código de barras próprio."
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setQrPrintDialog(false)}>Fechar</Button>
+          <Button onClick={handlePrintQrLabels} variant="contained" startIcon={<Download />}>Gerar folha de impressão</Button>
+        </DialogActions>
+      </Dialog>
+
       {/* Novo/Abastecer Produto */}
       <Dialog open={openProductDialog} onClose={() => setOpenProductDialog(false)} fullWidth maxWidth="sm">
         <DialogTitle>{isAdmin ? 'Novo Produto ou Abastecimento' : 'Abastecer Estoque'}</DialogTitle>
@@ -1036,7 +1179,7 @@ function App() {
             <Autocomplete freeSolo options={products.map((option) => option.name)} value={newProduct.name} onInputChange={(event, newInputValue) => setNewProduct(prev => ({ ...prev, name: newInputValue }))} onChange={(event, newValue) => handleProductSelect(event, newValue)} renderInput={(params) => (<TextField {...params} label="Nome do Produto" placeholder="Selecione ou digite um novo..." helperText="Se selecionar existente, será abastecimento." fullWidth />)} />
           </Box>
           <Box display="flex" gap={1} mb={2}>
-            <TextField label="Código de Barras" fullWidth value={newProduct.barcode} onChange={(e) => setNewProduct({ ...newProduct, barcode: e.target.value })} InputProps={{ endAdornment: <IconButton size="small" onClick={() => { setScannerOpen(true); }}><QrCodeScanner /></IconButton> }} />
+            <TextField label="Código de Barras" fullWidth value={newProduct.barcode} onChange={(e) => setNewProduct({ ...newProduct, barcode: e.target.value })} InputProps={{ endAdornment: <IconButton size="small" onClick={() => openScanner('newProduct')}><QrCodeScanner /></IconButton> }} />
           </Box>
           <Autocomplete freeSolo options={categoryOptions} value={newProduct.category} onInputChange={(event, value) => setNewProduct(prev => ({ ...prev, category: value || 'Geral' }))} renderInput={(params) => (<TextField {...params} label="Categoria" fullWidth />)} sx={{ mb: 2 }} />
           <Box display="flex" gap={2} mt={1}>
@@ -1057,7 +1200,7 @@ function App() {
           <DialogTitle>Editar Produto</DialogTitle>
           <DialogContent sx={{ pt: 2 }}>
             <TextField margin="dense" label="Nome" fullWidth value={editProductData.name} onChange={(e) => setEditProductData({ ...editProductData, name: e.target.value })} />
-            <TextField margin="dense" label="Código de Barras" fullWidth value={editProductData.barcode} onChange={(e) => setEditProductData({ ...editProductData, barcode: e.target.value })} sx={{ mt: 1 }} />
+            <TextField margin="dense" label="Código de Barras" fullWidth value={editProductData.barcode} onChange={(e) => setEditProductData({ ...editProductData, barcode: e.target.value })} sx={{ mt: 1 }} InputProps={{ endAdornment: <IconButton size="small" onClick={() => openScanner('editProduct')}><QrCodeScanner /></IconButton> }} />
             <Autocomplete freeSolo options={categoryOptions} value={editProductData.category || 'Geral'} onInputChange={(event, value) => setEditProductData(prev => ({ ...prev, category: value || 'Geral' }))} renderInput={(params) => (<TextField {...params} label="Categoria" fullWidth />)} sx={{ mt: 1 }} />
             <Box display="flex" gap={2} mt={2}>
               <TextField label="Custo Médio" type="number" fullWidth value={editProductData.cost_price} onChange={(e) => setEditProductData({ ...editProductData, cost_price: e.target.value })} />
