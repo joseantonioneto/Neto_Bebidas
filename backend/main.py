@@ -342,11 +342,11 @@ def migrate_schema():
             "UPDATE products SET category = 'Geral' WHERE category IS NULL OR category = ''"
         )
         conn.exec_driver_sql(
-            "UPDATE sales SET payment_method = CASE WHEN is_paid = 1 THEN 'dinheiro' ELSE 'fiado' END "
+            "UPDATE sales SET payment_method = CASE WHEN is_paid THEN 'dinheiro' ELSE 'fiado' END "
             "WHERE payment_method IS NULL OR payment_method = ''"
         )
         conn.exec_driver_sql(
-            "UPDATE sales SET payment_status = CASE WHEN is_paid = 1 THEN 'paid' ELSE 'pending' END "
+            "UPDATE sales SET payment_status = CASE WHEN is_paid THEN 'paid' ELSE 'pending' END "
             "WHERE payment_status IS NULL OR payment_status = ''"
         )
         conn.exec_driver_sql(
