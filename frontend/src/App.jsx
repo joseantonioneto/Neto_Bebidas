@@ -16,12 +16,16 @@ import {
   ShoppingCart, PersonAdd, Inventory, Add, Assessment,
   Logout, Storefront, Edit, Delete, Search, TrendingUp, Storage,
   AdminPanelSettings, Remove, Download, PointOfSale, QrCodeScanner,
-  CameraAlt, UploadFile, Close, People, CloudUpload
+  CameraAlt, UploadFile, Close, People, CloudUpload,
+  PhotoCamera, ContentCopy, ManageSearch, QrCode2
 } from '@mui/icons-material';
 
 import QRCode from 'qrcode';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
 import { format, subDays, parseISO, isAfter } from 'date-fns';
+
+import caminharLogo from './assets/caminhar-logo-branco.png';
+import igrejaCristoRei from './assets/igreja-cristo-rei.png';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
 const api = axios.create({ baseURL: API_BASE });
@@ -32,10 +36,119 @@ const FALLBACK_PAYMENT_METHODS = [
   { value: 'pix', label: 'Pix' },
   { value: 'cartao_debito', label: 'Cartão de débito' },
   { value: 'cartao_credito', label: 'Cartão de crédito' },
-  { value: 'pagbank', label: 'PagBank' },
   { value: 'fiado', label: 'Fiado' }
 ];
+
+// ==== Configuração PIX (dados da conta que RECEBE o pagamento) ====
+// Preencha com a chave e os dados do recebedor. Usado para gerar o QR "Pix Copia e Cola".
+const PIX_CONFIG = {
+  chave: 'b951c6fb-a380-4fd6-a528-4696c158e53e',   // chave aleatória
+  nome: 'Jose Antonio Souza Neto',                  // recebedor (máx. 25 caracteres, sem acento)
+  cidade: 'Natal'                                   // cidade do recebedor
+};
+const pixConfigured = () => PIX_CONFIG.chave && PIX_CONFIG.chave !== 'SUA_CHAVE_PIX_AQUI';
+
+// Monta um campo EMV (id + tamanho + valor) do padrão BR Code
+function pixField(id, value) {
+  const v = String(value);
+  return `${id}${v.length.toString().padStart(2, '0')}${v}`;
+}
+// CRC16-CCITT (polinômio 0x1021) exigido pelo BR Code
+function pixCrc16(payload) {
+  let crc = 0xFFFF;
+  for (let i = 0; i < payload.length; i++) {
+    crc ^= payload.charCodeAt(i) << 8;
+    for (let j = 0; j < 8; j++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xFFFF;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, '0');
+}
+// Gera o payload "Pix Copia e Cola" (estático com valor) a partir da config + valor da venda
+function buildPixPayload({ chave, nome, cidade, valor, txid = '***' }) {
+  const clean = (s, max) => String(s || '')
+    .normalize('NFD').replace(/[^A-Za-z0-9 ]/g, '').trim().slice(0, max);
+  const nomeF = clean(nome, 25) || 'RECEBEDOR';
+  const cidadeF = clean(cidade, 15) || 'BRASIL';
+  const mai = pixField('00', 'br.gov.bcb.pix') + pixField('01', String(chave).trim());
+  let p = '';
+  p += pixField('00', '01');       // Payload Format Indicator
+  p += pixField('26', mai);        // Merchant Account Information - PIX
+  p += pixField('52', '0000');     // Merchant Category Code
+  p += pixField('53', '986');      // Moeda = BRL
+  if (valor && Number(valor) > 0) p += pixField('54', Number(valor).toFixed(2));
+  p += pixField('58', 'BR');       // País
+  p += pixField('59', nomeF);      // Nome do recebedor
+  p += pixField('60', cidadeF);    // Cidade do recebedor
+  p += pixField('62', pixField('05', txid)); // Additional data - txid
+  p += '6304';                     // CRC placeholder
+  return p + pixCrc16(p);
+}
+
+// Redimensiona/comprime qualquer imagem para um JPEG quadrado (evita fotos de vários MB)
+async function resizeImageToDataUrl(file, size = 200, quality = 0.72) {
+  const dataUrl = await new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = () => res(reader.result);
+    reader.onerror = rej;
+    reader.readAsDataURL(file);
+  });
+  const img = await new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = rej;
+    i.src = dataUrl;
+  });
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, size, size);
+  const scale = Math.max(size / img.width, size / img.height); // cobre o quadrado
+  const w = img.width * scale;
+  const h = img.height * scale;
+  ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+  return canvas.toDataURL('image/jpeg', quality);
+}
+
 const formatCurrency = (value) => Number(value || 0).toFixed(2);
+const createSaleCode = () => `mercadinho-${Date.now()}`;
+const TURNSTILE_SCRIPT_ID = 'cloudflare-turnstile-api';
+const DEFAULT_SECURITY_CONFIG = { turnstile: { enabled: false, site_key: '', misconfigured: false } };
+
+let turnstileScriptPromise = null;
+
+function loadTurnstileScript() {
+  if (window.turnstile) return Promise.resolve(window.turnstile);
+  if (turnstileScriptPromise) return turnstileScriptPromise;
+
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById(TURNSTILE_SCRIPT_ID);
+    const resolveWhenReady = () => {
+      if (window.turnstile) resolve(window.turnstile);
+      else reject(new Error('Turnstile indisponível'));
+    };
+
+    if (existing) {
+      existing.addEventListener('load', resolveWhenReady, { once: true });
+      existing.addEventListener('error', reject, { once: true });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.id = TURNSTILE_SCRIPT_ID;
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    script.async = true;
+    script.defer = true;
+    script.onload = resolveWhenReady;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+
+  return turnstileScriptPromise;
+}
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
@@ -43,9 +156,49 @@ api.interceptors.request.use((config) => {
   return config;
 }, (error) => Promise.reject(error));
 
+function TurnstileWidget({ siteKey, resetKey, onVerify, onExpire, onError }) {
+  const containerRef = useRef(null);
+  const widgetIdRef = useRef(null);
+
+  useEffect(() => {
+    if (!siteKey || !containerRef.current) return undefined;
+    let mounted = true;
+
+    loadTurnstileScript()
+      .then((turnstile) => {
+        if (!mounted || !containerRef.current) return;
+        if (widgetIdRef.current) turnstile.remove(widgetIdRef.current);
+        widgetIdRef.current = turnstile.render(containerRef.current, {
+          sitekey: siteKey,
+          action: 'login',
+          theme: 'light',
+          size: 'flexible',
+          callback: onVerify,
+          'expired-callback': onExpire,
+          'timeout-callback': onExpire,
+          'error-callback': onError
+        });
+      })
+      .catch(onError);
+
+    return () => {
+      mounted = false;
+      if (window.turnstile && widgetIdRef.current) {
+        window.turnstile.remove(widgetIdRef.current);
+      }
+      widgetIdRef.current = null;
+    };
+  }, [siteKey, resetKey, onVerify, onExpire, onError]);
+
+  return (
+    <Box sx={{ display: 'flex', justifyContent: 'center', minHeight: 65, width: '100%', overflow: 'hidden' }}>
+      <div ref={containerRef} />
+    </Box>
+  );
+}
+
 // --- SCANNER COMPONENT ---
 function BarcodeScanner({ open, onClose, onScan }) {
-  const scannerRef = useRef(null);
   const html5QrCodeRef = useRef(null);
 
   useEffect(() => {
@@ -109,18 +262,25 @@ function App() {
   const [token, setToken] = useState(localStorage.getItem('token'));
   const [currentUser, setCurrentUser] = useState(null);
   const [authForm, setAuthForm] = useState({ username: '', password: '' });
+  const [securityConfig, setSecurityConfig] = useState(DEFAULT_SECURITY_CONFIG);
+  const [securityConfigLoaded, setSecurityConfigLoaded] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState('');
+  const [turnstileResetKey, setTurnstileResetKey] = useState(0);
 
   const [tabValue, setTabValue] = useState('resumo');
   const [cart, setCart] = useState([]);
   const [products, setProducts] = useState([]);
+  const [categoryCosts, setCategoryCosts] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [salesHistory, setSalesHistory] = useState([]);
   const [users, setUsers] = useState([]);
   const [reportSummary, setReportSummary] = useState(null);
   const [paymentMethods, setPaymentMethods] = useState(FALLBACK_PAYMENT_METHODS);
-  const [pagBankStatus, setPagBankStatus] = useState(null);
   const [selectedCustomer, setSelectedCustomer] = useState('');
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('dinheiro');
+  const [loginError, setLoginError] = useState('');
+  const [pixDialog, setPixDialog] = useState({ open: false, qr: '', payload: '', valor: 0 });
+  const [stockQuery, setStockQuery] = useState('');
 
   const [daysFilter, setDaysFilter] = useState(7);
   const [productFilter, setProductFilter] = useState(null);
@@ -136,8 +296,11 @@ function App() {
 
   const [openProductDialog, setOpenProductDialog] = useState(false);
   const [openEditProductDialog, setOpenEditProductDialog] = useState(false);
-  const [newProduct, setNewProduct] = useState({ name: '', category: 'Geral', cost_price: '', sell_price: '', stock: '', barcode: '' });
-  const [editProductData, setEditProductData] = useState({ id: null, name: '', category: 'Geral', cost_price: '', sell_price: '', stock: '', barcode: '' });
+  const [newProduct, setNewProduct] = useState({ name: '', category: 'Geral', cost_price: '', sell_price: '', stock: '', barcode: '', photo: '' });
+  const [editProductData, setEditProductData] = useState({ id: null, name: '', category: 'Geral', cost_price: '', sell_price: '', stock: '', barcode: '', photo: '' });
+  const [photoUploading, setPhotoUploading] = useState(false);
+  const [openCategoryCostDialog, setOpenCategoryCostDialog] = useState(false);
+  const [categoryCostForm, setCategoryCostForm] = useState({ description: '', category: 'Geral', amount: '', event_day: 'Dia 1' });
 
   const [openPayDialog, setOpenPayDialog] = useState(false);
   const [payData, setPayData] = useState({ customerId: null, customerName: '', amount: '' });
@@ -145,6 +308,7 @@ function App() {
   const [openUserDialog, setOpenUserDialog] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
   const [userForm, setUserForm] = useState({ username: '', password: '', role: 'vendedor' });
+  const [passwordChangeForm, setPasswordChangeForm] = useState({ newPassword: '', confirmPassword: '' });
 
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scanTarget, setScanTarget] = useState('sale'); // 'sale' | 'newProduct' | 'editProduct'
@@ -159,26 +323,65 @@ function App() {
   const [nfeImportResult, setNfeImportResult] = useState(null);
 
   const isAdmin = currentUser?.role === 'admin';
+  const turnstileEnabled = Boolean(securityConfig.turnstile?.enabled && securityConfig.turnstile?.site_key);
+  const turnstileMisconfigured = Boolean(securityConfig.turnstile?.misconfigured);
+  const loginBlocked = !securityConfigLoaded || turnstileMisconfigured || (turnstileEnabled && !turnstileToken);
 
-  useEffect(() => { if (token) fetchData(); }, [token]);
+  const showFeedback = useCallback((message, severity) => setFeedback({ open: true, message, severity }), []);
+
+  const resetTurnstile = useCallback(() => {
+    setTurnstileToken('');
+    setTurnstileResetKey(prev => prev + 1);
+  }, []);
+
+  const handleTurnstileExpire = useCallback(() => {
+    setTurnstileToken('');
+    showFeedback('Verificacao expirada. Confirme novamente.', 'info');
+  }, [showFeedback]);
+
+  const handleTurnstileError = useCallback(() => {
+    setTurnstileToken('');
+    showFeedback('Nao foi possivel carregar a verificacao de seguranca', 'warning');
+  }, [showFeedback]);
 
   useEffect(() => {
-    if (currentUser?.role === 'vendedor' && tabValue === 'resumo') {
-      setTabValue('vender');
-    }
-  }, [currentUser, tabValue]);
+    let active = true;
+    api.get('/security/config')
+      .then((res) => {
+        if (active) setSecurityConfig(res.data || DEFAULT_SECURITY_CONFIG);
+      })
+      .catch(() => {
+        if (active) setSecurityConfig(DEFAULT_SECURITY_CONFIG);
+      })
+      .finally(() => {
+        if (active) setSecurityConfigLoaded(true);
+      });
+    return () => { active = false; };
+  }, []);
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
       const meRes = await api.get('/me');
       const userIsAdmin = meRes.data.role === 'admin';
       setCurrentUser(meRes.data);
+      if (meRes.data.role === 'vendedor') {
+        setTabValue(prev => prev === 'resumo' ? 'vender' : prev);
+      }
 
-      const [prodRes, custRes, methodsRes, pagBankRes] = await Promise.all([
+      if (meRes.data.must_change_password) {
+        setProducts([]);
+        setCategoryCosts([]);
+        setCustomers([]);
+        setSalesHistory([]);
+        setUsers([]);
+        setReportSummary(null);
+        return;
+      }
+
+      const [prodRes, custRes, methodsRes] = await Promise.all([
         api.get('/products/'),
         api.get('/customers/'),
-        api.get('/payment-methods'),
-        api.get('/integrations/pagbank/status')
+        api.get('/payment-methods')
       ]);
       setProducts(prodRes.data);
       setCustomers(custRes.data);
@@ -188,44 +391,112 @@ function App() {
         return defaultCustomer ? defaultCustomer.id : prev;
       });
       setPaymentMethods(methodsRes.data);
-      setPagBankStatus(pagBankRes.data);
 
       if (userIsAdmin) {
-        const [salesRes, usersRes, summaryRes] = await Promise.all([
-          api.get('/sales/'), api.get('/users/'), api.get('/reports/summary')
+        const [salesRes, usersRes, summaryRes, categoryCostsRes] = await Promise.all([
+          api.get('/sales/'), api.get('/users/'), api.get('/reports/summary'), api.get('/category-costs/')
         ]);
         setSalesHistory(salesRes.data);
         setUsers(usersRes.data);
         setReportSummary(summaryRes.data);
+        setCategoryCosts(categoryCostsRes.data);
       } else {
         setSalesHistory([]);
         setUsers([]);
         setReportSummary(null);
+        setCategoryCosts([]);
       }
     } catch (error) {
       if (error.response && error.response.status === 401) {
         localStorage.removeItem('token'); setToken(null); setCurrentUser(null);
       }
     }
-  };
+  }, []);
 
-  const showFeedback = (message, severity) => setFeedback({ open: true, message, severity });
+  const addToCart = useCallback((p) => {
+    if (p.stock <= 0) return showFeedback('Sem estoque!', 'warning');
+    setCart(prev => {
+      const existing = prev.find((item) => item.id === p.id);
+      if (existing) {
+        if (existing.quantity >= p.stock) {
+          showFeedback('Quantidade máxima em estoque!', 'warning');
+          return prev;
+        }
+        return prev.map((item) => item.id === p.id ? { ...item, quantity: item.quantity + 1 } : item);
+      }
+      return [...prev, { ...p, quantity: 1 }];
+    });
+  }, [showFeedback]);
+
+  useEffect(() => {
+    if (!token) return undefined;
+    const timeoutId = window.setTimeout(() => {
+      fetchData();
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [token, fetchData]);
+
+  // Atualiza o estoque em tempo real enquanto a aba Consulta estiver aberta
+  useEffect(() => {
+    if (!token || tabValue !== 'consulta') return undefined;
+    const intervalId = window.setInterval(() => { fetchData(); }, 20000);
+    return () => window.clearInterval(intervalId);
+  }, [token, tabValue, fetchData]);
 
   const handleLogin = async () => {
+    if (!securityConfigLoaded) return showFeedback('Carregando verificacao de seguranca', 'info');
+    if (turnstileMisconfigured) return showFeedback('Turnstile nao configurado corretamente no Cloudflare', 'error');
+    if (turnstileEnabled && !turnstileToken) return showFeedback('Complete a verificacao de seguranca', 'warning');
+
     try {
-      const formData = new FormData();
+      const formData = new URLSearchParams();
       formData.append('username', authForm.username);
       formData.append('password', authForm.password);
-      const response = await api.post('/token', formData);
+      if (turnstileEnabled) formData.append('cf-turnstile-response', turnstileToken);
+      const response = await api.post('/token', formData, {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      });
       localStorage.setItem('token', response.data.access_token);
       setCurrentUser(response.data.user);
       setTabValue(response.data.user?.role === 'admin' ? 'resumo' : 'vender');
+      if (response.data.user?.must_change_password) {
+        showFeedback('Cadastre uma nova senha para continuar', 'info');
+      }
       setToken(response.data.access_token);
-    } catch (error) { showFeedback('Erro no login', 'error'); }
+    } catch (error) {
+      const detail = error.response?.data?.detail;
+      const status = error.response?.status;
+      setLoginError(
+        !error.response
+          ? 'Não foi possível conectar ao servidor. Verifique a internet e tente novamente.'
+          : (status === 400 || status === 401)
+            ? 'Usuário ou senha incorretos. Confira os dados e tente de novo.'
+            : (detail || 'Não foi possível entrar. Tente novamente.')
+      );
+      if (turnstileEnabled) resetTurnstile();
+    }
   };
 
   const handleLogout = () => {
     localStorage.removeItem('token'); setToken(null); setCurrentUser(null); setCart([]);
+    setPasswordChangeForm({ newPassword: '', confirmPassword: '' });
+  };
+
+  const handleRequiredPasswordChange = async () => {
+    const newPassword = passwordChangeForm.newPassword.trim();
+    const confirmPassword = passwordChangeForm.confirmPassword.trim();
+    if (newPassword.length < 6) return showFeedback('A nova senha precisa ter pelo menos 6 caracteres', 'warning');
+    if (newPassword !== confirmPassword) return showFeedback('As senhas não conferem', 'warning');
+
+    try {
+      const res = await api.post('/users/me/password', { new_password: newPassword });
+      setPasswordChangeForm({ newPassword: '', confirmPassword: '' });
+      setCurrentUser(res.data.user);
+      showFeedback('Senha alterada. Bem-vindo!', 'success');
+      fetchData();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao alterar senha', 'error');
+    }
   };
 
   // --- SCANNER ---
@@ -248,7 +519,7 @@ function App() {
     } catch {
       showFeedback(`Produto não encontrado: ${code}`, 'warning');
     }
-  }, [scanTarget]);
+  }, [scanTarget, addToCart, showFeedback]);
 
   const openScanner = (target) => {
     setScanTarget(target);
@@ -295,6 +566,9 @@ function App() {
   const totalCash = reportSummary?.totals?.paid_total ?? (totalSold - totalDebtCurrent);
   const reportDebt = reportSummary?.totals?.debt_total ?? totalDebtCurrent;
   const reportProfit = reportSummary?.totals?.profit_total ?? stockMetrics.potentialProfit;
+  const directCostTotal = reportSummary?.totals?.direct_cost_total ?? 0;
+  const categoryCostTotal = categoryCosts.reduce((sum, cost) => sum + Number(cost.amount || 0), 0);
+  const indirectCostTotal = reportSummary?.totals?.indirect_cost_total ?? categoryCostTotal;
   const cartTotal = cart.reduce((sum, item) => sum + (item.sell_price * item.quantity), 0);
   const categoryOptions = [...new Set(products.map((p) => p.category || 'Geral'))].sort();
 
@@ -323,21 +597,6 @@ function App() {
   };
 
   // --- ACOES ---
-  const addToCart = (p) => {
-    if (p.stock <= 0) return showFeedback('Sem estoque!', 'warning');
-    setCart(prev => {
-      const existing = prev.find((item) => item.id === p.id);
-      if (existing) {
-        if (existing.quantity >= p.stock) {
-          showFeedback('Quantidade máxima em estoque!', 'warning');
-          return prev;
-        }
-        return prev.map((item) => item.id === p.id ? { ...item, quantity: item.quantity + 1 } : item);
-      }
-      return [...prev, { ...p, quantity: 1 }];
-    });
-  };
-
   const updateCartQuantity = (productId, quantity) => {
     const product = products.find((p) => p.id === productId);
     const nextQuantity = Math.max(0, Math.min(parseInt(quantity || 0), product?.stock || 0));
@@ -360,19 +619,12 @@ function App() {
     }
     try {
       const items = cart.map((p) => ({ product_id: p.id, quantity: p.quantity }));
-      if (paymentMethod === 'pagbank') {
-        await api.post('/integrations/pagbank/payment-intents', {
-          amount: cartTotal,
-          payment_method: 'pagbank',
-          sale_code: `mercadinho-${Date.now()}`
-        });
-      }
       await api.post('/sales/', {
         customer_id: parseInt(selectedCustomer),
         items,
         is_paid: paymentMethod !== 'fiado',
         payment_method: paymentMethod,
-        payment_provider: paymentMethod === 'pagbank' ? 'pagbank' : null
+        payment_provider: null
       });
       showFeedback(paymentMethod === 'fiado' ? "FIADO anotado!" : "Venda registrada!", paymentMethod === 'fiado' ? 'info' : 'success');
       setCart([]);
@@ -380,6 +632,28 @@ function App() {
       fetchData();
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro na venda.', 'error');
+    }
+  };
+
+  // Abre o QR PIX com o valor exato do carrinho (antes de finalizar a venda)
+  const handleShowPix = async () => {
+    if (cart.length === 0) return showFeedback('Carrinho vazio!', 'warning');
+    if (!pixConfigured()) return showFeedback('Chave PIX ainda não configurada no sistema.', 'warning');
+    try {
+      const payload = buildPixPayload({ ...PIX_CONFIG, valor: cartTotal });
+      const qr = await QRCode.toDataURL(payload, { width: 320, margin: 1 });
+      setPixDialog({ open: true, qr, payload, valor: cartTotal });
+    } catch {
+      showFeedback('Erro ao gerar QR do PIX.', 'error');
+    }
+  };
+
+  const handleCopyPix = async () => {
+    try {
+      await navigator.clipboard.writeText(pixDialog.payload);
+      showFeedback('Código PIX copiado!', 'success');
+    } catch {
+      showFeedback('Não foi possível copiar. Copie manualmente.', 'warning');
     }
   };
 
@@ -412,7 +686,7 @@ function App() {
       });
       showFeedback('Estoque atualizado!', 'success');
       setOpenProductDialog(false);
-      setNewProduct({ name: '', category: 'Geral', cost_price: '', sell_price: '', stock: '', barcode: '' });
+      setNewProduct({ name: '', category: 'Geral', cost_price: '', sell_price: '', stock: '', barcode: '', photo: '' });
       fetchData();
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro ao salvar produto', 'error');
@@ -425,6 +699,53 @@ function App() {
       setOpenEditProductDialog(false); fetchData();
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro ao editar produto', 'error');
+    }
+  };
+
+  // Recebe a foto do produto, comprime para 200x200 (JPEG) e guarda como data URL
+  const handlePhotoSelect = async (file, target) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) return showFeedback('Selecione um arquivo de imagem.', 'warning');
+    setPhotoUploading(true);
+    try {
+      const dataUrl = await resizeImageToDataUrl(file, 200, 0.72);
+      if (target === 'edit') setEditProductData(prev => ({ ...prev, photo: dataUrl }));
+      else setNewProduct(prev => ({ ...prev, photo: dataUrl }));
+    } catch {
+      showFeedback('Não foi possível processar a imagem.', 'error');
+    } finally {
+      setPhotoUploading(false);
+    }
+  };
+
+  const handleCreateCategoryCost = async () => {
+    const amount = parseFloat(categoryCostForm.amount || 0);
+    if (!categoryCostForm.description || amount <= 0) return showFeedback('Informe descrição e valor do custo', 'warning');
+
+    try {
+      await api.post('/category-costs/', {
+        ...categoryCostForm,
+        amount,
+        category: categoryCostForm.category || 'Geral',
+        event_day: categoryCostForm.event_day || 'Dia 1'
+      });
+      showFeedback('Custo por setor registrado!', 'success');
+      setOpenCategoryCostDialog(false);
+      setCategoryCostForm({ description: '', category: 'Geral', amount: '', event_day: 'Dia 1' });
+      fetchData();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao registrar custo', 'error');
+    }
+  };
+
+  const handleDeleteCategoryCost = async (id) => {
+    if (!window.confirm('Remover este custo do fechamento?')) return;
+    try {
+      await api.delete(`/category-costs/${id}`);
+      showFeedback('Custo removido', 'success');
+      fetchData();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao remover custo', 'error');
     }
   };
 
@@ -502,7 +823,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
       const res = await api.post(`/products/generate-qrcode/${productId}`);
       showFeedback(res.data.generated ? `QR gerado: ${res.data.barcode}` : `Já possui: ${res.data.barcode}`, 'success');
       fetchData();
-    } catch (error) {
+    } catch {
       showFeedback('Erro ao gerar QR', 'error');
     }
   };
@@ -595,8 +916,13 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
       ['Total vendido', reportSummary.totals.gross_total],
       ['Recebido', reportSummary.totals.paid_total],
       ['Fiado', reportSummary.totals.debt_total],
-      ['Custo estimado', reportSummary.totals.cost_total],
+      ['Custo produtos', reportSummary.totals.direct_cost_total],
+      ['Custo setores', reportSummary.totals.indirect_cost_total],
+      ['Custo total', reportSummary.totals.cost_total],
       ['Lucro estimado', reportSummary.totals.profit_total],
+      [],
+      ['Setor de custo', 'Lançamentos', 'Total'],
+      ...(reportSummary.by_category_cost || []).map((row) => [row.category, row.count, row.total]),
       [],
       ['Forma de pagamento', 'Vendas', 'Total'],
       ...reportSummary.by_payment_method.map((row) => [row.label, row.count, row.total]),
@@ -635,15 +961,44 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="100vh" bgcolor="#f5f5f5">
         <Paper elevation={6} sx={{ p: 5, width: 380, maxWidth: '95vw', textAlign: 'center', borderRadius: 4 }}>
-          <Box sx={{ mb: 2, display: 'flex', justifyContent: 'center' }}><Storefront sx={{ fontSize: 50, color: '#1a237e' }} /></Box>
+          <Box sx={{ mb: 2, display: 'flex', justifyContent: 'center' }}>
+            <Box component="img" src={igrejaCristoRei} alt="Igreja de Cristo Rei" sx={{ width: 180, maxWidth: '100%', height: 'auto' }} />
+          </Box>
           <Typography variant="h4" fontWeight="900" color="#1a237e">MERCADINHO CAMINHAR</Typography>
           <Typography variant="caption" color="text.secondary">Igreja de Cristo Rei</Typography>
           <Box component="form" sx={{ mt: 3, display: 'flex', flexDirection: 'column', gap: 2 }}>
             <TextField label="Usuário" fullWidth onChange={(e) => setAuthForm({ ...authForm, username: e.target.value })} />
             <TextField label="Senha" type="password" fullWidth onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && handleLogin()} />
-            <Button variant="contained" size="large" onClick={handleLogin} sx={{ bgcolor: '#1a237e', py: 1.5 }}>ENTRAR</Button>
+            {!securityConfigLoaded && <LinearProgress />}
+            {turnstileMisconfigured && (
+              <Alert severity="error" variant="outlined" sx={{ textAlign: 'left' }}>
+                Turnstile precisa de chave publica e chave secreta.
+              </Alert>
+            )}
+            {turnstileEnabled && (
+              <TurnstileWidget
+                siteKey={securityConfig.turnstile.site_key}
+                resetKey={turnstileResetKey}
+                onVerify={setTurnstileToken}
+                onExpire={handleTurnstileExpire}
+                onError={handleTurnstileError}
+              />
+            )}
+            <Button variant="contained" size="large" onClick={handleLogin} disabled={loginBlocked} sx={{ bgcolor: '#1a237e', py: 1.5 }}>ENTRAR</Button>
           </Box>
         </Paper>
+        <Dialog open={!!loginError} onClose={() => setLoginError('')} maxWidth="xs" fullWidth>
+          <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, color: '#c62828' }}>
+            <Close sx={{ bgcolor: '#c62828', color: '#fff', borderRadius: '50%', fontSize: 26, p: 0.3 }} />
+            Não foi possível entrar
+          </DialogTitle>
+          <DialogContent>
+            <Typography>{loginError}</Typography>
+          </DialogContent>
+          <DialogActions>
+            <Button variant="contained" onClick={() => setLoginError('')} sx={{ bgcolor: '#1a237e' }}>Tentar novamente</Button>
+          </DialogActions>
+        </Dialog>
         <Snackbar open={feedback.open} autoHideDuration={4000} onClose={() => setFeedback({ ...feedback, open: false })}><Alert severity={feedback.severity}>{feedback.message}</Alert></Snackbar>
       </Box>
     );
@@ -661,8 +1016,49 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
     );
   }
 
+  if (currentUser.must_change_password) {
+    return (
+      <Box display="flex" justifyContent="center" alignItems="center" minHeight="100vh" bgcolor="#f0f2f5" p={2}>
+        <Paper elevation={3} sx={{ p: 4, width: '100%', maxWidth: 430, borderRadius: 3 }}>
+          <Box textAlign="center" mb={3}>
+            <Storefront sx={{ fontSize: 44, color: '#1a237e', mb: 1 }} />
+            <Typography variant="h5" fontWeight="900" color="#1a237e">Nova senha obrigatória</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+              Olá, {currentUser.username}. Cadastre sua senha definitiva para continuar.
+            </Typography>
+          </Box>
+          <Box display="flex" flexDirection="column" gap={2}>
+            <TextField
+              label="Nova senha"
+              type="password"
+              fullWidth
+              value={passwordChangeForm.newPassword}
+              onChange={(e) => setPasswordChangeForm({ ...passwordChangeForm, newPassword: e.target.value })}
+              autoFocus
+            />
+            <TextField
+              label="Confirmar nova senha"
+              type="password"
+              fullWidth
+              value={passwordChangeForm.confirmPassword}
+              onChange={(e) => setPasswordChangeForm({ ...passwordChangeForm, confirmPassword: e.target.value })}
+              onKeyDown={(e) => e.key === 'Enter' && handleRequiredPasswordChange()}
+            />
+            <Button variant="contained" size="large" onClick={handleRequiredPasswordChange} sx={{ bgcolor: '#1a237e', py: 1.3 }}>
+              Salvar nova senha
+            </Button>
+            <Button color="inherit" onClick={handleLogout}>Sair</Button>
+          </Box>
+        </Paper>
+        <Snackbar open={feedback.open} autoHideDuration={4000} onClose={() => setFeedback({ ...feedback, open: false })} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
+          <Alert severity={feedback.severity} variant="filled">{feedback.message}</Alert>
+        </Snackbar>
+      </Box>
+    );
+  }
+
   // --- CARRINHO MOBILE (DRAWER) ---
-  const CartContent = () => (
+  const renderCartContent = () => (
     <Box sx={{ p: 2, width: isMobile ? '100vw' : 'auto', maxWidth: 400 }}>
       <Typography variant="h6" gutterBottom><ShoppingCart /> Carrinho ({cart.length})</Typography>
       <Autocomplete options={customers} getOptionLabel={(o) => o.name} value={customers.find(c => c.id === selectedCustomer) || null} isOptionEqualToValue={(o, v) => o.id === v.id} onChange={(e, v) => setSelectedCustomer(v ? v.id : '')} renderInput={(params) => <TextField {...params} label="Cliente" size="small" />} sx={{ mb: 2 }} />
@@ -672,10 +1068,10 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           {paymentMethods.map((method) => <MenuItem key={method.value} value={method.value}>{method.label}</MenuItem>)}
         </Select>
       </FormControl>
-      {selectedPaymentMethod === 'pagbank' && (
-        <Alert severity={pagBankStatus?.ready ? 'success' : 'info'} sx={{ mb: 2 }}>
-          {pagBankStatus?.ready ? 'PagBank pronto' : 'PagBank preparado para bridge PlugPag'}
-        </Alert>
+      {selectedPaymentMethod === 'pix' && (
+        <Button fullWidth variant="outlined" color="success" startIcon={<QrCode2 />} onClick={handleShowPix} disabled={cart.length === 0} sx={{ mb: 2 }}>
+          Mostrar QR do PIX (R$ {formatCurrency(cartTotal)})
+        </Button>
       )}
       <List dense sx={{ maxHeight: isMobile ? '40vh' : 260, overflow: 'auto', bgcolor: '#fafafa', mb: 2, p: 0 }}>
         {cart.map((item) => (
@@ -709,7 +1105,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
     <Box sx={{ flexGrow: 1, bgcolor: '#f0f2f5', minHeight: '100vh', pb: isMobile ? 10 : 5 }}>
       <AppBar position="static" sx={{ bgcolor: '#1a237e' }}>
         <Toolbar>
-          <Storefront sx={{ mr: 1 }} />
+          <Box component="img" src={caminharLogo} alt="Caminhar - Paróquia de Cristo Rei" sx={{ height: isMobile ? 32 : 40, width: 'auto', mr: 1.5 }} />
           <Typography variant={isMobile ? "body1" : "h6"} sx={{ flexGrow: 1, fontWeight: 'bold' }}>
             {isMobile ? 'CAMINHAR' : 'MERCADINHO CAMINHAR'}
           </Typography>
@@ -720,6 +1116,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           <Tabs value={tabValue} onChange={(e, v) => setTabValue(v)} textColor="inherit" indicatorColor="secondary" centered>
             {isAdmin && <Tab value="resumo" label="Resumo" icon={<Assessment />} />}
             <Tab value="vender" label="Vender" icon={<ShoppingCart />} />
+            <Tab value="consulta" label="Consulta" icon={<ManageSearch />} />
             <Tab value="clientes" label="Clientes" icon={<People />} />
             <Tab value="estoque" label="Estoque" icon={<Inventory />} />
             {isAdmin && <Tab value="usuarios" label="Usuários" icon={<AdminPanelSettings />} />}
@@ -736,6 +1133,8 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #4caf50' }}><Typography variant="caption" color="text.secondary">Recebido</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold" color="success.main">R$ {formatCurrency(totalCash)}</Typography></Paper></Grid>
             <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #ff9800' }}><Typography variant="caption" color="text.secondary">Fiado</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(reportDebt)}</Typography></Paper></Grid>
             <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #9c27b0' }}><Typography variant="caption" color="text.secondary">Lucro Estimado</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold" color="secondary">R$ {formatCurrency(reportProfit)}</Typography></Paper></Grid>
+            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #607d8b' }}><Typography variant="caption" color="text.secondary">Custo Produtos</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(directCostTotal)}</Typography></Paper></Grid>
+            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #795548' }}><Typography variant="caption" color="text.secondary">Custo Setores</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(indirectCostTotal)}</Typography></Paper></Grid>
 
             <Grid item xs={12}>
               <Paper sx={{ p: isMobile ? 2 : 3, height: isMobile ? 300 : 400, display: 'flex', flexDirection: 'column' }}>
@@ -816,6 +1215,22 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Grid>
             )}
 
+            {reportSummary?.by_category_cost?.length > 0 && (
+              <Grid item xs={12} md={5}>
+                <Paper sx={{ p: 2 }}>
+                  <Typography variant="h6" gutterBottom>Custos por Setor</Typography>
+                  <Table size="small">
+                    <TableHead><TableRow><TableCell>Setor</TableCell><TableCell align="center">Lanç.</TableCell><TableCell align="right">Total</TableCell></TableRow></TableHead>
+                    <TableBody>
+                      {reportSummary.by_category_cost.map((row) => (
+                        <TableRow key={row.category}><TableCell>{row.category}</TableCell><TableCell align="center">{row.count}</TableCell><TableCell align="right">R$ {formatCurrency(row.total)}</TableCell></TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </Paper>
+              </Grid>
+            )}
+
             <Grid item xs={12}>
               <Paper sx={{ p: 2 }}>
                 <Typography variant="h6" gutterBottom>Histórico de Vendas</Typography>
@@ -840,6 +1255,63 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           </Grid>
         )}
 
+        {/* === ABA CONSULTA (estoque em tempo real, todos os perfis) === */}
+        {tabValue === 'consulta' && (
+          <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
+            <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
+              <Typography variant="h5">Consulta de Estoque</Typography>
+              <Button variant="outlined" size="small" startIcon={<ManageSearch />} onClick={fetchData}>Atualizar</Button>
+            </Box>
+            <TextField
+              fullWidth
+              placeholder="Buscar produto..."
+              value={stockQuery}
+              onChange={(e) => setStockQuery(e.target.value)}
+              sx={{ mb: 2 }}
+              InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }}
+            />
+            {(() => {
+              const term = stockQuery.trim().toLowerCase();
+              const list = [...products]
+                .filter((p) => !term || p.name.toLowerCase().includes(term) || (p.category || '').toLowerCase().includes(term) || (p.barcode || '').includes(term))
+                .sort((a, b) => a.name.localeCompare(b.name));
+              const totalUnidades = list.reduce((s, p) => s + (p.stock || 0), 0);
+              return (
+                <>
+                  <Typography variant="caption" color="text.secondary">
+                    {list.length} {list.length === 1 ? 'produto' : 'produtos'} · {totalUnidades} unidades no total
+                  </Typography>
+                  <Grid container spacing={1} sx={{ mt: 0.5 }}>
+                    {list.map((p) => {
+                      const out = p.stock <= 0;
+                      const low = !out && p.stock < 5;
+                      const color = out ? '#c62828' : low ? '#ef6c00' : '#2e7d32';
+                      return (
+                        <Grid item xs={12} sm={6} md={4} key={p.id}>
+                          <Paper variant="outlined" sx={{ p: 1.25, display: 'flex', alignItems: 'center', gap: 1.5, borderLeft: `5px solid ${color}` }}>
+                            {p.photo
+                              ? <Box component="img" src={p.photo} alt={p.name} sx={{ width: 48, height: 48, borderRadius: 1, objectFit: 'cover', flexShrink: 0 }} />
+                              : <Box sx={{ width: 48, height: 48, borderRadius: 1, bgcolor: '#eceff1', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><Storefront sx={{ color: '#b0bec5' }} /></Box>}
+                            <Box sx={{ minWidth: 0, flexGrow: 1 }}>
+                              <Typography variant="body2" fontWeight="bold" noWrap>{p.name}</Typography>
+                              <Typography variant="caption" color="text.secondary" noWrap display="block">{p.category || 'Geral'}</Typography>
+                            </Box>
+                            <Box sx={{ textAlign: 'center', flexShrink: 0, minWidth: 56 }}>
+                              <Typography variant="h5" fontWeight="900" sx={{ color, lineHeight: 1 }}>{p.stock}</Typography>
+                              <Typography variant="caption" sx={{ color }}>{out ? 'esgotado' : 'em estoque'}</Typography>
+                            </Box>
+                          </Paper>
+                        </Grid>
+                      );
+                    })}
+                    {!list.length && <Grid item xs={12}><Typography align="center" color="text.secondary" sx={{ py: 4 }}>Nenhum produto encontrado.</Typography></Grid>}
+                  </Grid>
+                </>
+              );
+            })()}
+          </Container>
+        )}
+
         {/* === ABA VENDAS === */}
         {tabValue === 'vender' && (
           <Grid container spacing={isMobile ? 2 : 3}>
@@ -856,6 +1328,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 {filteredProducts.map((p) => (
                   <Grid item xs={6} sm={4} md={3} key={p.id}>
                     <Card sx={{ height: '100%', display: 'flex', flexDirection: 'column', opacity: p.stock > 0 ? 1 : 0.5 }}>
+                      {p.photo && <Box component="img" src={p.photo} alt={p.name} sx={{ width: '100%', height: isMobile ? 90 : 120, objectFit: 'cover' }} />}
                       <CardContent sx={{ flexGrow: 1, p: isMobile ? 1 : 1.5 }}>
                         <Typography fontWeight="bold" noWrap variant={isMobile ? "body2" : "body1"}>{p.name}</Typography>
                         <Typography variant="caption" color="text.secondary">{p.category} | Est: {p.stock}</Typography>
@@ -876,7 +1349,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             {!isMobile && (
               <Grid item xs={12} md={4}>
                 <Paper sx={{ p: 2, position: 'sticky', top: 20 }}>
-                  <CartContent />
+                  {renderCartContent()}
                 </Paper>
               </Grid>
             )}
@@ -946,6 +1419,11 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               <Typography variant="h5">Estoque</Typography>
               <Box display="flex" gap={1} flexWrap="wrap">
                 {isAdmin && (
+                  <Button variant="outlined" color="warning" onClick={() => setOpenCategoryCostDialog(true)} startIcon={<Storage />} size={isMobile ? "small" : "medium"}>
+                    Custos
+                  </Button>
+                )}
+                {isAdmin && (
                   <Button variant="outlined" color="secondary" onClick={() => setQrPrintDialog(true)} startIcon={<QrCodeScanner />} size={isMobile ? "small" : "medium"}>
                     Etiquetas QR
                   </Button>
@@ -960,6 +1438,41 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 </Button>
               </Box>
             </Box>
+            {isAdmin && (
+              <Paper sx={{ p: 2, mb: 2 }}>
+                <Box display="flex" justifyContent="space-between" alignItems="center" mb={1} gap={1} flexWrap="wrap">
+                  <Typography variant="h6">Custos por Setor</Typography>
+                  <Chip label={`Total: R$ ${formatCurrency(categoryCostTotal)}`} color="warning" variant="outlined" />
+                </Box>
+                <TableContainer sx={{ maxHeight: 220 }}>
+                  <Table size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Descrição</TableCell>
+                        <TableCell>Setor</TableCell>
+                        <TableCell align="right">Valor</TableCell>
+                        {!isMobile && <TableCell>Data</TableCell>}
+                        <TableCell align="center">Ação</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {categoryCosts.map((cost) => (
+                        <TableRow key={cost.id}>
+                          <TableCell>{cost.description}</TableCell>
+                          <TableCell><Chip label={cost.category || 'Geral'} size="small" /></TableCell>
+                          <TableCell align="right">R$ {formatCurrency(cost.amount)}</TableCell>
+                          {!isMobile && <TableCell>{new Date(cost.created_at).toLocaleDateString()}</TableCell>}
+                          <TableCell align="center">
+                            <IconButton size="small" color="error" onClick={() => handleDeleteCategoryCost(cost.id)}><Delete /></IconButton>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                      {!categoryCosts.length && <TableRow><TableCell colSpan={isMobile ? 4 : 5} align="center">Sem custos lançados</TableCell></TableRow>}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Paper>
+            )}
             <TableContainer component={Paper}>
               <Table size="small">
                 <TableHead sx={{ bgcolor: '#eee' }}>
@@ -1016,6 +1529,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                         <Box display="flex" alignItems="center" gap={1}>
                           {user.username}
                           {user.id === currentUser.id && <Chip label="Você" size="small" />}
+                          {user.must_change_password && <Chip label="Trocar senha" size="small" color="warning" />}
                         </Box>
                       </TableCell>
                       <TableCell><Chip label={ROLE_LABELS[user.role] || user.role} color={user.role === 'admin' ? 'primary' : 'default'} size="small" /></TableCell>
@@ -1043,6 +1557,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           >
             {isAdmin && <BottomNavigationAction label="Resumo" value="resumo" icon={<Assessment />} />}
             <BottomNavigationAction label="Vender" value="vender" icon={<ShoppingCart />} />
+            <BottomNavigationAction label="Consulta" value="consulta" icon={<ManageSearch />} />
             <BottomNavigationAction label="Clientes" value="clientes" icon={<People />} />
             <BottomNavigationAction label="Estoque" value="estoque" icon={<Inventory />} />
             {isAdmin && <BottomNavigationAction label="Users" value="usuarios" icon={<AdminPanelSettings />} />}
@@ -1060,7 +1575,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           )}
 
           <Drawer anchor="bottom" open={cartOpen} onClose={() => setCartOpen(false)} PaperProps={{ sx: { borderTopLeftRadius: 16, borderTopRightRadius: 16, maxHeight: '90vh' } }}>
-            <CartContent />
+            {renderCartContent()}
           </Drawer>
         </>
       )}
@@ -1171,6 +1686,50 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         </DialogActions>
       </Dialog>
 
+      {/* Novo Custo por Setor */}
+      {isAdmin && (
+        <Dialog open={openCategoryCostDialog} onClose={() => setOpenCategoryCostDialog(false)} fullWidth maxWidth="sm">
+          <DialogTitle>Novo Custo por Setor</DialogTitle>
+          <DialogContent sx={{ pt: 2, display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <TextField
+              autoFocus
+              label="Descrição"
+              fullWidth
+              value={categoryCostForm.description}
+              onChange={(e) => setCategoryCostForm({ ...categoryCostForm, description: e.target.value })}
+              placeholder="Cebola, gelo, embalagem..."
+            />
+            <Autocomplete
+              freeSolo
+              options={categoryOptions}
+              value={categoryCostForm.category}
+              onInputChange={(event, value) => setCategoryCostForm(prev => ({ ...prev, category: value || 'Geral' }))}
+              renderInput={(params) => (<TextField {...params} label="Setor vinculado" fullWidth />)}
+            />
+            <Box display="flex" gap={2}>
+              <TextField
+                label="Valor"
+                type="number"
+                fullWidth
+                value={categoryCostForm.amount}
+                onChange={(e) => setCategoryCostForm({ ...categoryCostForm, amount: e.target.value })}
+                inputProps={{ min: 0, step: 0.01 }}
+              />
+              <TextField
+                label="Dia/Evento"
+                fullWidth
+                value={categoryCostForm.event_day}
+                onChange={(e) => setCategoryCostForm({ ...categoryCostForm, event_day: e.target.value })}
+              />
+            </Box>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => setOpenCategoryCostDialog(false)}>Cancelar</Button>
+            <Button onClick={handleCreateCategoryCost} variant="contained">Salvar</Button>
+          </DialogActions>
+        </Dialog>
+      )}
+
       {/* Novo/Abastecer Produto */}
       <Dialog open={openProductDialog} onClose={() => setOpenProductDialog(false)} fullWidth maxWidth="sm">
         <DialogTitle>{isAdmin ? 'Novo Produto ou Abastecimento' : 'Abastecer Estoque'}</DialogTitle>
@@ -1187,10 +1746,23 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <TextField label="Venda" type="number" fullWidth value={newProduct.sell_price} onChange={(e) => setNewProduct({ ...newProduct, sell_price: e.target.value })} />
           </Box>
           <TextField margin="dense" label="Quantidade" type="number" fullWidth sx={{ mt: 2 }} value={newProduct.stock} onChange={(e) => setNewProduct({ ...newProduct, stock: e.target.value })} inputProps={{ min: 0 }} />
+          <Box display="flex" alignItems="center" gap={2} mt={2}>
+            <Box sx={{ width: 72, height: 72, borderRadius: 1, border: '1px dashed #bbb', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, bgcolor: '#fafafa' }}>
+              {newProduct.photo ? <Box component="img" src={newProduct.photo} alt="Foto" sx={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <PhotoCamera sx={{ color: '#bbb' }} />}
+            </Box>
+            <Box>
+              <Button component="label" variant="outlined" size="small" startIcon={<PhotoCamera />} disabled={photoUploading}>
+                {photoUploading ? 'Processando...' : (newProduct.photo ? 'Trocar foto' : 'Adicionar foto')}
+                <input type="file" accept="image/*" hidden onChange={(e) => { handlePhotoSelect(e.target.files?.[0], 'new'); e.target.value = ''; }} />
+              </Button>
+              {newProduct.photo && <Button size="small" color="error" onClick={() => setNewProduct(prev => ({ ...prev, photo: '' }))} sx={{ ml: 1 }}>Remover</Button>}
+              <Typography variant="caption" display="block" color="text.secondary" sx={{ mt: 0.5 }}>Ajustada para 200x200 automaticamente.</Typography>
+            </Box>
+          </Box>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpenProductDialog(false)}>Cancelar</Button>
-          <Button onClick={handleCreateProduct} variant="contained">Salvar</Button>
+          <Button onClick={handleCreateProduct} variant="contained" disabled={photoUploading}>Salvar</Button>
         </DialogActions>
       </Dialog>
 
@@ -1207,20 +1779,64 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               <TextField label="Venda" type="number" fullWidth value={editProductData.sell_price} onChange={(e) => setEditProductData({ ...editProductData, sell_price: e.target.value })} />
             </Box>
             <TextField margin="dense" label="Estoque (Correção)" type="number" fullWidth sx={{ mt: 2 }} value={editProductData.stock} onChange={(e) => setEditProductData({ ...editProductData, stock: e.target.value })} helperText="Isso altera diretamente a quantidade." />
+            <Box display="flex" alignItems="center" gap={2} mt={2}>
+              <Box sx={{ width: 72, height: 72, borderRadius: 1, border: '1px dashed #bbb', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, bgcolor: '#fafafa' }}>
+                {editProductData.photo ? <Box component="img" src={editProductData.photo} alt="Foto" sx={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <PhotoCamera sx={{ color: '#bbb' }} />}
+              </Box>
+              <Box>
+                <Button component="label" variant="outlined" size="small" startIcon={<PhotoCamera />} disabled={photoUploading}>
+                  {photoUploading ? 'Processando...' : (editProductData.photo ? 'Trocar foto' : 'Adicionar foto')}
+                  <input type="file" accept="image/*" hidden onChange={(e) => { handlePhotoSelect(e.target.files?.[0], 'edit'); e.target.value = ''; }} />
+                </Button>
+                {editProductData.photo && <Button size="small" color="error" onClick={() => setEditProductData(prev => ({ ...prev, photo: '' }))} sx={{ ml: 1 }}>Remover</Button>}
+                <Typography variant="caption" display="block" color="text.secondary" sx={{ mt: 0.5 }}>Ajustada para 200x200 automaticamente.</Typography>
+              </Box>
+            </Box>
           </DialogContent>
           <DialogActions>
             <Button onClick={() => setOpenEditProductDialog(false)}>Cancelar</Button>
-            <Button onClick={handleSaveEdit} variant="contained">Salvar</Button>
+            <Button onClick={handleSaveEdit} variant="contained" disabled={photoUploading}>Salvar</Button>
           </DialogActions>
         </Dialog>
       )}
+
+      {/* QR Code PIX */}
+      <Dialog open={pixDialog.open} onClose={() => setPixDialog(prev => ({ ...prev, open: false }))} fullWidth maxWidth="xs">
+        <DialogTitle sx={{ textAlign: 'center' }}>Pagamento via PIX</DialogTitle>
+        <DialogContent sx={{ textAlign: 'center' }}>
+          <Typography variant="h5" fontWeight="900" color="#2e7d32" gutterBottom>R$ {formatCurrency(pixDialog.valor)}</Typography>
+          {pixDialog.qr && <Box component="img" src={pixDialog.qr} alt="QR Code PIX" sx={{ width: 240, maxWidth: '100%', mx: 'auto', display: 'block' }} />}
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+            Aponte a câmera do app do banco ou use o Pix Copia e Cola abaixo.
+          </Typography>
+          <TextField
+            value={pixDialog.payload}
+            fullWidth
+            multiline
+            maxRows={3}
+            size="small"
+            InputProps={{ readOnly: true }}
+            sx={{ mt: 2 }}
+            onFocus={(e) => e.target.select()}
+          />
+          <Button fullWidth variant="outlined" startIcon={<ContentCopy />} onClick={handleCopyPix} sx={{ mt: 1 }}>
+            Copiar código PIX
+          </Button>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, flexDirection: 'column', gap: 1 }}>
+          <Button fullWidth variant="contained" color="success" onClick={() => { setPixDialog(prev => ({ ...prev, open: false })); handleFinishSale(true); }}>
+            Recebido — Finalizar venda
+          </Button>
+          <Button fullWidth onClick={() => setPixDialog(prev => ({ ...prev, open: false }))}>Cancelar</Button>
+        </DialogActions>
+      </Dialog>
 
       {/* Usuario */}
       <Dialog open={openUserDialog} onClose={() => setOpenUserDialog(false)} fullWidth maxWidth="sm">
         <DialogTitle>{editingUser ? 'Editar Usuário' : 'Novo Usuário'}</DialogTitle>
         <DialogContent sx={{ pt: 2 }}>
           <TextField margin="dense" label="Usuário" fullWidth value={userForm.username} onChange={(e) => setUserForm({ ...userForm, username: e.target.value })} />
-          <TextField margin="dense" label="Senha" type="password" fullWidth value={userForm.password} onChange={(e) => setUserForm({ ...userForm, password: e.target.value })} helperText={editingUser ? 'Deixe em branco para manter a senha atual.' : ''} />
+          <TextField margin="dense" label="Senha" type="password" fullWidth value={userForm.password} onChange={(e) => setUserForm({ ...userForm, password: e.target.value })} helperText={editingUser ? 'Se preencher, o usuário trocará a senha no próximo login.' : 'O usuário trocará esta senha no primeiro login.'} />
           <FormControl fullWidth margin="dense">
             <InputLabel>Perfil</InputLabel>
             <Select label="Perfil" value={userForm.role} onChange={(e) => setUserForm({ ...userForm, role: e.target.value })}>

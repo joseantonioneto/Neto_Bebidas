@@ -2,9 +2,12 @@ import os
 import io
 import csv
 import uuid
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+import json
+import urllib.parse
+import urllib.request
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, Text
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload, declarative_base
 from pydantic import BaseModel
@@ -17,6 +20,9 @@ from collections import Counter
 SECRET_KEY = os.getenv("SECRET_KEY", "netobebidas-chave-secreta-mude-isso-em-producao")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "600"))
+TURNSTILE_SITE_KEY = os.getenv("TURNSTILE_SITE_KEY", os.getenv("TURNSTILE_SITEKEY", ""))
+TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", os.getenv("TURNSTILE_SECRET", ""))
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 ADMIN_ROLE = "admin"
 SELLER_ROLE = "vendedor"
 VALID_ROLES = {ADMIN_ROLE, SELLER_ROLE}
@@ -25,7 +31,6 @@ PAYMENT_METHODS = {
     "pix": "Pix",
     "cartao_debito": "Cartão de débito",
     "cartao_credito": "Cartão de crédito",
-    "pagbank": "PagBank",
     "fiado": "Fiado"
 }
 
@@ -59,6 +64,7 @@ class User(Base):
     username = Column(String(100), unique=True, index=True)
     hashed_password = Column(String(255))
     role = Column(String(20), default=SELLER_ROLE)
+    must_change_password = Column(Boolean, default=True)
 
 
 class Product(Base):
@@ -70,6 +76,17 @@ class Product(Base):
     cost_price = Column(Float)
     sell_price = Column(Float)
     stock = Column(Integer)
+    photo = Column(Text, nullable=True)
+
+
+class CategoryCost(Base):
+    __tablename__ = "category_costs"
+    id = Column(Integer, primary_key=True, index=True)
+    description = Column(String(200))
+    category = Column(String(100), default="Geral")
+    amount = Column(Float)
+    event_day = Column(String(40), default="Dia 1")
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Customer(Base):
@@ -124,6 +141,10 @@ class UserUpdate(BaseModel):
     password: Optional[str] = None
     role: Optional[str] = None
 
+class UserPasswordChange(BaseModel):
+    current_password: Optional[str] = None
+    new_password: str
+
 class ProductCreate(BaseModel):
     name: str
     cost_price: float
@@ -131,6 +152,7 @@ class ProductCreate(BaseModel):
     stock: int
     category: Optional[str] = "Geral"
     barcode: Optional[str] = None
+    photo: Optional[str] = None
 
 class ProductUpdate(BaseModel):
     name: Optional[str] = None
@@ -139,6 +161,13 @@ class ProductUpdate(BaseModel):
     sell_price: Optional[float] = None
     stock: Optional[int] = None
     barcode: Optional[str] = None
+    photo: Optional[str] = None
+
+class CategoryCostCreate(BaseModel):
+    description: str
+    category: Optional[str] = "Geral"
+    amount: float
+    event_day: Optional[str] = "Dia 1"
 
 class CustomerCreate(BaseModel):
     name: str
@@ -162,11 +191,6 @@ class SaleCreate(BaseModel):
     payment_provider: Optional[str] = None
     payment_reference: Optional[str] = None
 
-class PagBankPaymentIntentCreate(BaseModel):
-    amount: float
-    payment_method: str
-    sale_code: Optional[str] = None
-    terminal_mac_address: Optional[str] = None
 
 class BulkCustomerItem(BaseModel):
     name: str
@@ -228,10 +252,26 @@ def serialize_product(p: Product):
         "cost_price": p.cost_price,
         "sell_price": p.sell_price,
         "stock": p.stock,
+        "photo": p.photo,
+    }
+
+def serialize_category_cost(cost: CategoryCost):
+    return {
+        "id": cost.id,
+        "description": cost.description,
+        "category": cost.category or "Geral",
+        "amount": cost.amount or 0,
+        "event_day": cost.event_day or "Dia 1",
+        "created_at": cost.created_at.isoformat() if cost.created_at else datetime.utcnow().isoformat(),
     }
 
 def serialize_user(user: User):
-    return {"id": user.id, "username": user.username, "role": user.role}
+    return {
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "must_change_password": bool(user.must_change_password),
+    }
 
 def serialize_customer(c: Customer):
     return {
@@ -308,6 +348,8 @@ def migrate_schema():
             user_columns = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(users)").fetchall()]
             if "role" not in user_columns:
                 conn.exec_driver_sql(f"ALTER TABLE users ADD COLUMN role VARCHAR DEFAULT '{ADMIN_ROLE}'")
+            if "must_change_password" not in user_columns:
+                conn.exec_driver_sql("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT 1")
 
             product_columns = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(products)").fetchall()]
             if "category" not in product_columns:
@@ -339,6 +381,9 @@ def migrate_schema():
             "UPDATE users SET role = 'admin' WHERE role IS NULL OR role = ''"
         )
         conn.exec_driver_sql(
+            "UPDATE users SET must_change_password = 1 WHERE must_change_password IS NULL"
+        )
+        conn.exec_driver_sql(
             "UPDATE products SET category = 'Geral' WHERE category IS NULL OR category = ''"
         )
         conn.exec_driver_sql(
@@ -368,7 +413,8 @@ def seed_defaults():
             db.add(User(
                 username=os.getenv("ADMIN_USERNAME", "admin"),
                 hashed_password=pwd_context.hash(admin_password),
-                role=ADMIN_ROLE
+                role=ADMIN_ROLE,
+                must_change_password=True
             ))
             print(f"[seed] Usuário admin criado (senha padrão: {admin_password} — altere após o primeiro login)")
 
@@ -385,11 +431,15 @@ seed_defaults()
 
 
 def require_admin(u: User = Depends(get_current_user)):
+    if u.must_change_password:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Troque sua senha antes de continuar")
     if u.role != ADMIN_ROLE:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Apenas administrador")
     return u
 
 def require_seller_or_admin(u: User = Depends(get_current_user)):
+    if u.must_change_password:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Troque sua senha antes de continuar")
     if u.role not in VALID_ROLES:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão")
     return u
@@ -400,15 +450,84 @@ def ensure_admin_will_remain(db: Session, user: User):
         raise HTTPException(status_code=400, detail="É preciso manter ao menos um administrador")
 
 
+def turnstile_state():
+    enabled = bool(TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY)
+    misconfigured = bool(TURNSTILE_SITE_KEY or TURNSTILE_SECRET_KEY) and not enabled
+    return {"enabled": enabled, "misconfigured": misconfigured}
+
+
+def is_turnstile_test_secret(secret_key: str):
+    return secret_key in {
+        "1x0000000000000000000000000000000AA",
+        "2x0000000000000000000000000000000AA",
+        "3x0000000000000000000000000000000AA",
+    }
+
+
+def verify_turnstile(token: str, client_ip: Optional[str] = None):
+    state = turnstile_state()
+    if not state["enabled"] and not state["misconfigured"]:
+        return
+    if state["misconfigured"]:
+        raise HTTPException(status_code=500, detail="Turnstile não configurado corretamente")
+    if not token:
+        raise HTTPException(status_code=400, detail="Complete a verificação de segurança")
+
+    payload = {
+        "secret": TURNSTILE_SECRET_KEY,
+        "response": token,
+    }
+    if client_ip:
+        payload["remoteip"] = client_ip
+
+    try:
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(TURNSTILE_VERIFY_URL, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as res:
+            result = json.loads(res.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Não foi possível validar a verificação de segurança")
+
+    action_mismatch = (
+        result.get("action")
+        and result.get("action") != "login"
+        and not is_turnstile_test_secret(TURNSTILE_SECRET_KEY)
+    )
+    if not result.get("success") or action_mismatch:
+        raise HTTPException(status_code=400, detail="Verificação de segurança inválida. Tente novamente")
+
+
 # --- ROTAS ---
 
+@app.get("/security/config")
+def read_security_config():
+    state = turnstile_state()
+    return {
+        "turnstile": {
+            "enabled": state["enabled"],
+            "site_key": TURNSTILE_SITE_KEY if state["enabled"] else "",
+            "misconfigured": state["misconfigured"]
+        }
+    }
+
+
 @app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == form_data.username).first()
-    if not user or not pwd_context.verify(form_data.password, user.hashed_password):
+async def login(request: Request, db: Session = Depends(get_db)):
+    form_data = await request.form()
+    username = str(form_data.get("username") or "").strip()
+    password = str(form_data.get("password") or "")
+    turnstile_token = str(form_data.get("cf-turnstile-response") or form_data.get("turnstile_token") or "")
+    verify_turnstile(turnstile_token, request.client.host if request.client else None)
+
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not pwd_context.verify(password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Login incorreto")
     return {
-        "access_token": create_access_token(data={"sub": user.username, "role": user.role}),
+        "access_token": create_access_token(data={
+            "sub": user.username,
+            "role": user.role,
+            "must_change_password": bool(user.must_change_password),
+        }),
         "token_type": "bearer",
         "user": serialize_user(user)
     }
@@ -416,6 +535,26 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
 @app.get("/me")
 def read_me(u: User = Depends(get_current_user)):
     return serialize_user(u)
+
+@app.post("/users/me/password")
+def change_own_password(
+    data: UserPasswordChange,
+    db: Session = Depends(get_db),
+    u: User = Depends(get_current_user)
+):
+    if len(data.new_password or "") < 6:
+        raise HTTPException(status_code=400, detail="A nova senha precisa ter pelo menos 6 caracteres")
+    if not u.must_change_password:
+        if not data.current_password or not pwd_context.verify(data.current_password, u.hashed_password):
+            raise HTTPException(status_code=400, detail="Senha atual incorreta")
+    if pwd_context.verify(data.new_password, u.hashed_password):
+        raise HTTPException(status_code=400, detail="A nova senha precisa ser diferente da senha atual")
+
+    u.hashed_password = pwd_context.hash(data.new_password)
+    u.must_change_password = False
+    db.commit()
+    db.refresh(u)
+    return {"message": "Senha atualizada", "user": serialize_user(u)}
 
 
 # --- USUARIOS ---
@@ -435,7 +574,8 @@ def create_user(user: UserCreate, db: Session = Depends(get_db), u: User = Depen
     db_user = User(
         username=username,
         hashed_password=pwd_context.hash(user.password),
-        role=normalize_role(user.role)
+        role=normalize_role(user.role),
+        must_change_password=True
     )
     db.add(db_user)
     db.commit()
@@ -459,6 +599,7 @@ def update_user(id: int, user: UserUpdate, db: Session = Depends(get_db), u: Use
 
     if user.password:
         db_user.hashed_password = pwd_context.hash(user.password)
+        db_user.must_change_password = True
 
     if user.role:
         new_role = normalize_role(user.role)
@@ -522,6 +663,8 @@ def create_product(p: ProductCreate, db: Session = Depends(get_db), u: User = De
             existing_barcode.category = category
             if name:
                 existing_barcode.name = name
+            if p.photo:
+                existing_barcode.photo = p.photo
             db.commit()
             db.refresh(existing_barcode)
             return serialize_product(existing_barcode)
@@ -540,11 +683,13 @@ def create_product(p: ProductCreate, db: Session = Depends(get_db), u: User = De
         existing.category = category
         if barcode and not existing.barcode:
             existing.barcode = barcode
+        if p.photo:
+            existing.photo = p.photo
         db.commit()
         db.refresh(existing)
         return serialize_product(existing)
 
-    new_p = Product(name=name, category=category, barcode=barcode, cost_price=p.cost_price, sell_price=p.sell_price, stock=p.stock)
+    new_p = Product(name=name, category=category, barcode=barcode, cost_price=p.cost_price, sell_price=p.sell_price, stock=p.stock, photo=p.photo)
     db.add(new_p)
     db.commit()
     db.refresh(new_p)
@@ -568,6 +713,8 @@ def update_product(id: int, p: ProductUpdate, db: Session = Depends(get_db), u: 
         db_p.stock = p.stock
     if p.barcode is not None:
         db_p.barcode = p.barcode.strip() or None
+    if p.photo is not None:
+        db_p.photo = p.photo or None
 
     db.commit()
     db.refresh(db_p)
@@ -710,6 +857,41 @@ async def import_nfe(file: UploadFile = File(...), db: Session = Depends(get_db)
         "updated": updated,
         "items": items_imported,
     }
+
+
+# --- CUSTOS POR SETOR ---
+
+@app.get("/category-costs/")
+def list_category_costs(db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    rows = db.query(CategoryCost).order_by(CategoryCost.created_at.desc(), CategoryCost.id.desc()).all()
+    return [serialize_category_cost(row) for row in rows]
+
+
+@app.post("/category-costs/")
+def create_category_cost(data: CategoryCostCreate, db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    description = (data.description or "").strip()
+    category = (data.category or "Geral").strip() or "Geral"
+    event_day = normalize_event_day(data.event_day) or "Dia 1"
+    if not description:
+        raise HTTPException(status_code=400, detail="Informe a descrição do custo")
+    if data.amount <= 0:
+        raise HTTPException(status_code=400, detail="Informe um valor maior que zero")
+
+    cost = CategoryCost(description=description, category=category, amount=data.amount, event_day=event_day)
+    db.add(cost)
+    db.commit()
+    db.refresh(cost)
+    return serialize_category_cost(cost)
+
+
+@app.delete("/category-costs/{id}")
+def delete_category_cost(id: int, db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    cost = db.query(CategoryCost).filter(CategoryCost.id == id).first()
+    if not cost:
+        raise HTTPException(status_code=404, detail="Custo não encontrado")
+    db.delete(cost)
+    db.commit()
+    return {"message": "Custo removido"}
 
 
 # --- CLIENTES ---
@@ -879,7 +1061,7 @@ def create_sale(sale: SaleCreate, db: Session = Depends(get_db), u: User = Depen
         is_paid=is_paid,
         payment_method=payment_method,
         payment_status="paid" if is_paid else "pending",
-        payment_provider=sale.payment_provider or ("pagbank" if payment_method == "pagbank" else None),
+        payment_provider=sale.payment_provider or None,
         payment_reference=sale.payment_reference,
         event_day=event_day
     )
@@ -934,7 +1116,7 @@ def sales_summary(
     by_product = {}
     by_seller = {}
     gross_total = 0.0
-    cost_total = 0.0
+    direct_cost_total = 0.0
     debt_total = 0.0
 
     for sale in sales:
@@ -965,7 +1147,7 @@ def sales_summary(
         for item in sale.items:
             item_cost = item.quantity * item.unit_cost_price
             item_total = item.quantity * item.unit_sell_price
-            cost_total += item_cost
+            direct_cost_total += item_cost
             product_name = item.product.name if item.product else f"Produto {item.product_id}"
             category = item.product.category if item.product and item.product.category else "Geral"
             by_product.setdefault(item.product_id, {
@@ -976,6 +1158,27 @@ def sales_summary(
             by_product[item.product_id]["total"] += item_total
             by_product[item.product_id]["cost"] += item_cost
 
+    category_cost_query = db.query(CategoryCost)
+    if event_day:
+        category_cost_query = category_cost_query.filter(CategoryCost.event_day == event_day)
+    if start_date:
+        category_cost_query = category_cost_query.filter(CategoryCost.created_at >= datetime.fromisoformat(start_date))
+    if end_date:
+        end = datetime.fromisoformat(end_date)
+        if len(end_date) == 10:
+            end = end.replace(hour=23, minute=59, second=59)
+        category_cost_query = category_cost_query.filter(CategoryCost.created_at <= end)
+
+    category_costs = category_cost_query.order_by(CategoryCost.created_at.desc(), CategoryCost.id.desc()).all()
+    indirect_cost_total = sum(cost.amount or 0 for cost in category_costs)
+    by_category_cost = {}
+    for cost in category_costs:
+        category = cost.category or "Geral"
+        by_category_cost.setdefault(category, {"category": category, "count": 0, "total": 0.0})
+        by_category_cost[category]["count"] += 1
+        by_category_cost[category]["total"] += cost.amount or 0
+
+    cost_total = direct_cost_total + indirect_cost_total
     paid_total = gross_total - debt_total
     return {
         "filters": {"event_day": event_day, "start_date": start_date, "end_date": end_date},
@@ -984,12 +1187,16 @@ def sales_summary(
             "gross_total": gross_total,
             "paid_total": paid_total,
             "debt_total": debt_total,
+            "direct_cost_total": direct_cost_total,
+            "indirect_cost_total": indirect_cost_total,
             "cost_total": cost_total,
             "profit_total": gross_total - cost_total
         },
         "by_payment_method": sorted(by_payment.values(), key=lambda row: row["label"]),
         "by_event_day": sorted(by_event_day.values(), key=lambda row: row["date"]),
         "by_seller": sorted(by_seller.values(), key=lambda row: row["total"], reverse=True),
+        "by_category_cost": sorted(by_category_cost.values(), key=lambda row: row["total"], reverse=True),
+        "category_costs": [serialize_category_cost(cost) for cost in category_costs],
         "top_products": sorted(by_product.values(), key=lambda row: row["total"], reverse=True),
         "sales": [serialize_sale(sale) for sale in sales]
     }
@@ -998,40 +1205,6 @@ def sales_summary(
 @app.get("/payment-methods")
 def list_payment_methods(u: User = Depends(require_seller_or_admin)):
     return [{"value": value, "label": label} for value, label in PAYMENT_METHODS.items()]
-
-@app.get("/integrations/pagbank/status")
-def pagbank_status(u: User = Depends(require_seller_or_admin)):
-    return {
-        "provider": "pagbank",
-        "mode": "plugpag",
-        "ready": False,
-        "message": "Estrutura preparada. PlugPag exige bridge nativo com Bluetooth e terminal PagBank físico.",
-        "requirements": [
-            "terminal_pagbank_compativel",
-            "mac_address_bluetooth",
-            "bridge_nativo_plugpag",
-            "homologacao_fluxo_operacional"
-        ]
-    }
-
-@app.post("/integrations/pagbank/payment-intents")
-def create_pagbank_payment_intent(intent: PagBankPaymentIntentCreate, u: User = Depends(require_seller_or_admin)):
-    if intent.amount <= 0:
-        raise HTTPException(status_code=400, detail="Valor inválido")
-    if intent.payment_method not in {"cartao_debito", "cartao_credito", "pagbank"}:
-        raise HTTPException(status_code=400, detail="Forma PagBank inválida")
-
-    return {
-        "provider": "pagbank",
-        "mode": "plugpag",
-        "status": "bridge_required",
-        "sale_code": intent.sale_code,
-        "amount": intent.amount,
-        "payment_method": intent.payment_method,
-        "terminal_mac_address": intent.terminal_mac_address,
-        "message": "Quando o bridge PlugPag estiver instalado, este endpoint enviará a cobrança para a maquineta."
-    }
-
 
 @app.get("/health")
 def health_check():
