@@ -1,6 +1,14 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "mercadinho-caminhar",
-  "compatibility_date": "2026-08-02",
-  "pages_build_output_dir": "./dist"
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "mercadinho-caminhar",
+	"compatibility_date": "2026-08-02",
+	"pages_build_output_dir": "./dist",
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "mercadinho-caminhar-db",
+			"database_id": "7a7fbcbc-fd0e-4419-be9d-5563a86afd5a",
+			"remote": true
+		}
+	]
 }

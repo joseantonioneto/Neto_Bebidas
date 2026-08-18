@@ -1,11 +1,10 @@
-# Deploy do backend FastAPI no Render
+# Deploy do backend FastAPI no Render (legado)
 
-Este backend esta preparado para rodar como Web Service Docker no Render, usando Postgres gerenciado.
+Este caminho ficou como referencia legada. O deploy atual usa Cloudflare Pages Functions + D1 e nao precisa de Render.
 
-Arquivos importantes:
+Atencao: os planos pagos do Render podem gerar custo mensal. Evite criar Blueprint pelo `render.yaml` se a intencao for manter tudo no plano Cloudflare/D1.
 
-- `backend/Dockerfile`: cria a imagem FastAPI.
-- `render.yaml`: define o servico `mercadinho-caminhar-api` e o banco `mercadinho-caminhar-db`.
+O arquivo `render.yaml` foi removido para evitar criacao acidental de servicos pagos no Render.
 
 ## Como publicar
 
