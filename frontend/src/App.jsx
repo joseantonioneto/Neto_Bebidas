@@ -121,6 +121,48 @@ async function resizeImageToDataUrl(file, size = 200, quality = 0.72) {
   return canvas.toDataURL('image/jpeg', quality);
 }
 
+// Compõe um cartão de voucher (QR + infos) num único PNG, para o comprador guardar/receber
+async function composeVoucherImage(voucher, qrDataUrl) {
+  const W = 440, H = 600;
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#1a237e';
+  ctx.fillRect(0, 0, W, 74);
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 24px system-ui, Arial, sans-serif';
+  ctx.fillText('MERCADINHO CAMINHAR', W / 2, 36);
+  ctx.font = '15px system-ui, Arial, sans-serif';
+  ctx.fillText('Voucher de Pré-venda — Igreja de Cristo Rei', W / 2, 58);
+
+  const qr = await new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = rej;
+    i.src = qrDataUrl;
+  });
+  const qrSize = 270;
+  ctx.drawImage(qr, (W - qrSize) / 2, 96, qrSize, qrSize);
+
+  ctx.fillStyle = '#1a237e';
+  ctx.font = 'bold 32px system-ui, Arial, sans-serif';
+  ctx.fillText(voucher.code, W / 2, 415);
+  ctx.fillStyle = '#111111';
+  ctx.font = 'bold 22px system-ui, Arial, sans-serif';
+  ctx.fillText(voucher.customer_name || '', W / 2, 452);
+  ctx.fillStyle = '#2e7d32';
+  ctx.font = 'bold 24px system-ui, Arial, sans-serif';
+  ctx.fillText(`${voucher.quantity}x ${voucher.product} · R$ ${Number(voucher.total_value || 0).toFixed(2)}`, W / 2, 492);
+  ctx.fillStyle = '#666666';
+  ctx.font = '16px system-ui, Arial, sans-serif';
+  ctx.fillText('Apresente este QR Code na retirada', W / 2, 540);
+  return canvas.toDataURL('image/png');
+}
+
 const formatCurrency = (value) => Number(value || 0).toFixed(2);
 const createSaleCode = () => `mercadinho-${Date.now()}`;
 const TURNSTILE_SCRIPT_ID = 'cloudflare-turnstile-api';
@@ -797,10 +839,11 @@ function App() {
         payment_method: voucherForm.payment_method,
         product: 'Combo'
       });
-      const qr = await QRCode.toDataURL(data.code, { width: 320, margin: 1 });
+      const qrRaw = await QRCode.toDataURL(data.code, { width: 320, margin: 1 });
+      const card = await composeVoucherImage(data, qrRaw);
       setOpenVoucherDialog(false);
       setVoucherForm({ customer_name: '', customer_phone: '', quantity: 1, unit_price: COMBO_PRESALE_PRICE, payment_method: 'dinheiro' });
-      setVoucherResult({ open: true, voucher: data, qr });
+      setVoucherResult({ open: true, voucher: data, qr: card });
       fetchVouchers();
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro ao gerar voucher', 'error');
@@ -808,8 +851,9 @@ function App() {
   };
 
   const openVoucherQr = async (voucher) => {
-    const qr = await QRCode.toDataURL(voucher.code, { width: 320, margin: 1 });
-    setVoucherResult({ open: true, voucher, qr });
+    const qrRaw = await QRCode.toDataURL(voucher.code, { width: 320, margin: 1 });
+    const card = await composeVoucherImage(voucher, qrRaw);
+    setVoucherResult({ open: true, voucher, qr: card });
   };
 
   const handleShareVoucher = async () => {
