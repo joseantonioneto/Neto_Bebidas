@@ -254,6 +254,19 @@ function BarcodeScanner({ open, onClose, onScan }) {
   useEffect(() => {
     if (!open) return;
     let scanner = null;
+    let stopped = false;
+
+    // Para o scanner com segurança: o stop() pode LANÇAR erro síncrono
+    // ("Cannot stop, scanner is not running or paused") — por isso o try/catch.
+    const stopScanner = async () => {
+      if (stopped) return;
+      stopped = true;
+      const s = html5QrCodeRef.current;
+      html5QrCodeRef.current = null;
+      if (!s) return;
+      try { await s.stop(); } catch { /* já parado/parando */ }
+      try { s.clear(); } catch { /* ignore */ }
+    };
 
     const startScanner = async () => {
       const { Html5Qrcode } = await import('html5-qrcode');
@@ -266,8 +279,8 @@ function BarcodeScanner({ open, onClose, onScan }) {
           { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 },
           (decodedText) => {
             onScan(decodedText);
-            scanner.stop().catch(() => {});
             onClose();
+            stopScanner();
           },
           () => {}
         );
@@ -280,10 +293,7 @@ function BarcodeScanner({ open, onClose, onScan }) {
 
     return () => {
       clearTimeout(timer);
-      if (html5QrCodeRef.current) {
-        html5QrCodeRef.current.stop().catch(() => {});
-        html5QrCodeRef.current = null;
-      }
+      stopScanner();
     };
   }, [open, onScan, onClose]);
 
