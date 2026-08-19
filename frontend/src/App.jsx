@@ -462,6 +462,14 @@ function App() {
     return () => window.clearInterval(intervalId);
   }, [token, tabValue, fetchData]);
 
+  const fetchVouchers = useCallback(async () => {
+    try {
+      const [listRes, sumRes] = await Promise.all([api.get('/vouchers'), api.get('/vouchers/summary')]);
+      setVouchers(listRes.data);
+      setVoucherSummaryData(sumRes.data);
+    } catch { /* silencioso */ }
+  }, []);
+
   // Carrega os vouchers ao abrir a aba Pré-venda
   useEffect(() => {
     if (!token || tabValue !== 'prevenda') return undefined;
@@ -773,14 +781,6 @@ function App() {
   };
 
   // ===== Pré-venda (vouchers) =====
-  const fetchVouchers = useCallback(async () => {
-    try {
-      const [listRes, sumRes] = await Promise.all([api.get('/vouchers'), api.get('/vouchers/summary')]);
-      setVouchers(listRes.data);
-      setVoucherSummaryData(sumRes.data);
-    } catch { /* silencioso */ }
-  }, []);
-
   const handleCreateVoucher = async () => {
     const name = voucherForm.customer_name.trim();
     if (!name) return showFeedback('Informe o nome do comprador', 'warning');
