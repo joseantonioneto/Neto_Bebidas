@@ -164,6 +164,20 @@ async function composeVoucherImage(voucher, qrDataUrl) {
 }
 
 const formatCurrency = (value) => Number(value || 0).toFixed(2);
+
+// Formata data/hora no fuso de Brasília. O banco grava em UTC (sem indicador de fuso),
+// então marcamos como UTC (Z) antes de converter para America/Sao_Paulo.
+function formatDateTimeBR(value, dateOnly = false) {
+  if (!value) return '';
+  let s = String(value).trim();
+  if (s.includes(' ') && !s.includes('T')) s = s.replace(' ', 'T');
+  if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(s)) s += 'Z';
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return String(value);
+  return d.toLocaleString('pt-BR', dateOnly
+    ? { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', year: 'numeric' }
+    : { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
 const createSaleCode = () => `mercadinho-${Date.now()}`;
 const TURNSTILE_SCRIPT_ID = 'cloudflare-turnstile-api';
 const DEFAULT_SECURITY_CONFIG = { turnstile: { enabled: false, site_key: '', misconfigured: false } };
@@ -923,6 +937,28 @@ function App() {
     }
   };
 
+  const handleExportVouchers = () => {
+    if (!vouchers.length) return showFeedback('Nenhuma pré-venda para exportar', 'info');
+    const header = ['Código', 'Comprador', 'Telefone', 'Qtd', 'Preço Unit', 'Total', 'Pagamento', 'Status', 'Criado em', 'Retirado em', 'Retirado por'];
+    const statusLabel = (s) => s === 'retirado' ? 'Retirado' : s === 'cancelado' ? 'Cancelado' : 'A retirar';
+    const rows = vouchers.map((v) => [
+      v.code, v.customer_name, v.customer_phone || '', v.quantity,
+      formatCurrency(v.unit_price), formatCurrency(v.total_value),
+      v.payment_method_label || v.payment_method, statusLabel(v.status),
+      formatDateTimeBR(v.created_at), formatDateTimeBR(v.redeemed_at), v.redeemed_by || ''
+    ]);
+    const csv = '﻿' + [header, ...rows]
+      .map((row) => row.map((cell) => `"${String(cell ?? '').replaceAll('"', '""')}"`).join(';'))
+      .join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'pre-venda-combos.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const handlePayDebt = async () => {
     if (!payData.amount || payData.amount <= 0) return;
     try {
@@ -1509,7 +1545,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                     <TableBody>
                       {salesHistory.map((sale) => (
                         <TableRow key={sale.id}>
-                          <TableCell>{new Date(sale.created_at).toLocaleString()}</TableCell>
+                          <TableCell>{formatDateTimeBR(sale.created_at)}</TableCell>
                           <TableCell>{sale.customer?.name || '---'}</TableCell>
                           <TableCell>{sale.seller_username || '---'}</TableCell>
                           <TableCell>R$ {formatCurrency(sale.total_value)}</TableCell>
@@ -1530,6 +1566,9 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
               <Typography variant="h5">Pré-venda de Combos</Typography>
               <Box display="flex" gap={1} flexWrap="wrap">
+                <Button variant="outlined" startIcon={<Download />} onClick={handleExportVouchers} size={isMobile ? 'small' : 'medium'}>
+                  Exportar Excel
+                </Button>
                 <Button variant="contained" color="success" startIcon={<QrCodeScanner />} onClick={() => openScanner('voucher')} size={isMobile ? 'small' : 'medium'}>
                   Retirar (escanear)
                 </Button>
@@ -1806,7 +1845,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                           <TableCell>{cost.description}</TableCell>
                           <TableCell><Chip label={cost.category || 'Geral'} size="small" /></TableCell>
                           <TableCell align="right">R$ {formatCurrency(cost.amount)}</TableCell>
-                          {!isMobile && <TableCell>{new Date(cost.created_at).toLocaleDateString()}</TableCell>}
+                          {!isMobile && <TableCell>{formatDateTimeBR(cost.created_at, true)}</TableCell>}
                           <TableCell align="center">
                             <IconButton size="small" color="error" onClick={() => handleDeleteCategoryCost(cost.id)}><Delete /></IconButton>
                           </TableCell>
@@ -2296,7 +2335,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               )}
               {redeemDialog.voucher.status === 'retirado' && (
                 <Alert severity="error" sx={{ textAlign: 'left', mb: 1 }}>
-                  ⚠️ Já retirado em {redeemDialog.voucher.redeemed_at}{redeemDialog.voucher.redeemed_by ? ` por ${redeemDialog.voucher.redeemed_by}` : ''}.
+                  ⚠️ Já retirado em {formatDateTimeBR(redeemDialog.voucher.redeemed_at)}{redeemDialog.voucher.redeemed_by ? ` por ${redeemDialog.voucher.redeemed_by}` : ''}.
                 </Alert>
               )}
               {redeemDialog.voucher.status === 'cancelado' && (

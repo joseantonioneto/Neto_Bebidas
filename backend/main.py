@@ -1290,6 +1290,19 @@ def create_voucher(payload: VoucherCreate, db: Session = Depends(get_db), u: Use
         created_by=u.username,
     )
     db.add(v); db.commit(); db.refresh(v)
+
+    # Registra o comprador na lista de clientes (se ainda não existir)
+    try:
+        existing = db.query(Customer).filter(Customer.name == name).first()
+        if not existing:
+            c = Customer(name=name, phone=(payload.customer_phone or "").strip() or None, group_name="Pré-venda", debt=0)
+            db.add(c); db.commit()
+        elif (payload.customer_phone or "").strip() and not existing.phone:
+            existing.phone = (payload.customer_phone or "").strip()
+            db.commit()
+    except Exception:
+        db.rollback()
+
     return serialize_voucher(v)
 
 @app.get("/vouchers/summary")

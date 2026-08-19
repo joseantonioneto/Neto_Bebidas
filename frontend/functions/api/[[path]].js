@@ -1409,6 +1409,17 @@ async function createVoucher(request, db, user) {
     INSERT INTO vouchers (code, customer_name, customer_phone, product, quantity, unit_price, total_value, payment_method, status, created_by, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pago', ?, CURRENT_TIMESTAMP)
   `, code, name, phone, product, quantity, unitPrice, total, paymentMethod, user.username);
+
+  // Registra o comprador na lista de clientes (se ainda nao existir)
+  try {
+    const existingCustomer = await first(db, 'SELECT id, phone FROM customers WHERE lower(name) = lower(?)', name);
+    if (!existingCustomer) {
+      await run(db, 'INSERT INTO customers (name, phone, group_name, debt) VALUES (?, ?, ?, 0)', name, phone, 'Pré-venda');
+    } else if (phone && !existingCustomer.phone) {
+      await run(db, 'UPDATE customers SET phone = ? WHERE id = ?', phone, existingCustomer.id);
+    }
+  } catch { /* nao bloqueia a criacao do voucher */ }
+
   return serializeVoucher(await first(db, 'SELECT * FROM vouchers WHERE id = ?', lastRowId(result)));
 }
 
