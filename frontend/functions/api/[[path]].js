@@ -8,6 +8,19 @@ const PAYMENT_METHODS = {
   fiado: 'Fiado'
 };
 
+// Chave pública RSA para o "connect challenge" do PagBank (a privada fica fora do repositório).
+const PAGBANK_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvAoJx/AthlMgPkvnqONw
+67AK4dqDsNOiBJz1SZ/c0R64TbWtRLQHaCOKMlYSmEp6mUcNYwA96TODlf+A7hDo
+JbGPSvK57yubf84lKxlaW4t6vMEAww1sC4Ugfh7BmLTgmRBXMzGBIfGmgiT/vj+b
+Izu6A/Mv04aKIeHYZdPrQ0pjSbkJfSlG6hp/sgvPLfzFczEw5cBhYsAzr9hAi6A4
+rrp1jqEoJaIVpORvH4aZqhIZVNHc/yYzAJYgRxaoGrtjREgX6lFJihL7US1eNXRQ
+fBqDyangAWo05Cv2vBjSD+U+hre3nuK1hfX//Sx4MfR+lF2K1RRNq6AgZWSyx2ZH
+bQIDAQAB
+-----END PUBLIC KEY-----
+`;
+const PAGBANK_KEY_CREATED_AT = 1787061427913;
+
 const ADMIN_ROLE = 'admin';
 const SELLER_ROLE = 'vendedor';
 const VALID_ROLES = new Set([ADMIN_ROLE, SELLER_ROLE]);
@@ -1135,6 +1148,11 @@ async function handle(request, env, params) {
     return json(securityConfig(env));
   }
 
+  // Endpoint público do "connect challenge" do PagBank (serve a chave pública)
+  if (resource === 'public-key' && request.method === 'GET') {
+    return json({ public_key: PAGBANK_PUBLIC_KEY, created_at: PAGBANK_KEY_CREATED_AT });
+  }
+
   if (resource === 'token' && request.method === 'POST') return login(request, env, db);
 
   const currentUser = await getCurrentUser(request, env, db);
@@ -1152,6 +1170,29 @@ async function handle(request, env, params) {
   if (resource === 'payment-methods' && request.method === 'GET') {
     requireSellerOrAdmin(currentUser);
     return json(Object.entries(PAYMENT_METHODS).map(([value, label]) => ({ value, label })));
+  }
+
+  if (resource === 'pix' && second === 'charge' && !third && request.method === 'POST') {
+    requireSellerOrAdmin(currentUser);
+    return json(await createPixCharge(request, env));
+  }
+
+  if (resource === 'pix' && second === 'charge' && third && request.method === 'GET') {
+    requireSellerOrAdmin(currentUser);
+    return json(await getPixStatus(third, env));
+  }
+
+  if (resource === 'vouchers') {
+    requireSellerOrAdmin(currentUser);
+    if (!second && request.method === 'GET') return json(await listVouchers(db));
+    if (!second && request.method === 'POST') return json(await createVoucher(request, db, currentUser));
+    if (second === 'summary' && request.method === 'GET') return json(await voucherSummary(db));
+    if (second === 'code' && third && request.method === 'GET') return json(await getVoucherByCode(db, third));
+    if (second && third === 'redeem' && request.method === 'POST') return json(await redeemVoucher(db, intValue(second), currentUser));
+    if (second && third === 'cancel' && request.method === 'POST') {
+      requireAdmin(currentUser);
+      return json(await cancelVoucher(db, intValue(second)));
+    }
   }
 
   if (resource === 'users') {
@@ -1240,6 +1281,182 @@ async function handle(request, env, params) {
   }
 
   throw new HttpError(404, 'Rota nao encontrada');
+}
+
+function pagbankConfig(env) {
+  const token = env.PAGBANK_TOKEN || '';
+  const base = env.PAGBANK_ENV === 'sandbox'
+    ? 'https://sandbox.api.pagseguro.com'
+    : 'https://api.pagseguro.com';
+  return { token, base };
+}
+
+// Cria uma cobranca PIX (order com QR Code) no PagBank e devolve o texto/imagem do QR
+async function createPixCharge(request, env) {
+  const { token, base } = pagbankConfig(env);
+  if (!token) throw new HttpError(503, 'PIX automatico nao configurado');
+  const data = await readJson(request);
+  const cents = Math.round(numberValue(data.amount) * 100);
+  if (cents <= 0) throw new HttpError(400, 'Valor invalido');
+
+  const expiration = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  const taxId = String(env.PAGBANK_DEFAULT_TAXID || '').replace(/\D/g, '');
+  const customer = {
+    name: String(data.customer_name || env.PAGBANK_DEFAULT_NAME || 'Consumidor Final').slice(0, 60),
+    email: env.PAGBANK_DEFAULT_EMAIL || 'cliente@mercadinhocaminhar.com'
+  };
+  if (taxId) customer.tax_id = taxId;
+
+  const body = {
+    reference_id: String(data.reference_id || `venda-${Date.now()}`).slice(0, 60),
+    customer,
+    items: [{ name: 'Venda Mercadinho Caminhar', quantity: 1, unit_amount: cents }],
+    qr_codes: [{ amount: { value: cents }, expiration_date: expiration }]
+  };
+
+  const resp = await fetch(`${base}/orders`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      accept: 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+  const result = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg = result?.error_messages?.[0]?.description || result?.message || 'erro ao gerar cobranca PIX';
+    throw new HttpError(502, `PagBank: ${msg}`);
+  }
+  const qr = (result.qr_codes && result.qr_codes[0]) || {};
+  const image = (qr.links || []).find((l) => l.media === 'image/png' || (l.rel || '').includes('QRCODE.PNG'));
+  return {
+    order_id: result.id || null,
+    qr_text: qr.text || null,
+    qr_image: image ? image.href : null,
+    expiration: qr.expiration_date || expiration
+  };
+}
+
+// Consulta um pedido no PagBank e informa se ja foi pago
+async function getPixStatus(orderId, env) {
+  const { token, base } = pagbankConfig(env);
+  if (!token) throw new HttpError(503, 'PIX automatico nao configurado');
+  const resp = await fetch(`${base}/orders/${encodeURIComponent(orderId)}`, {
+    headers: { Authorization: `Bearer ${token}`, accept: 'application/json' }
+  });
+  const result = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new HttpError(502, 'Erro ao consultar pagamento');
+  const charges = result.charges || [];
+  const paid = charges.some((c) => c.status === 'PAID');
+  return { paid, status: paid ? 'PAID' : (charges[0] ? charges[0].status : 'WAITING') };
+}
+
+// ===== Pré-venda (vouchers de combo com QR Code) =====
+function serializeVoucher(row) {
+  return {
+    id: row.id,
+    code: row.code,
+    customer_name: row.customer_name,
+    customer_phone: row.customer_phone || null,
+    product: row.product || 'Combo',
+    quantity: intValue(row.quantity),
+    unit_price: numberValue(row.unit_price),
+    total_value: numberValue(row.total_value),
+    payment_method: row.payment_method,
+    payment_method_label: PAYMENT_METHODS[row.payment_method] || row.payment_method,
+    status: row.status,
+    created_by: row.created_by || null,
+    created_at: row.created_at,
+    redeemed_by: row.redeemed_by || null,
+    redeemed_at: row.redeemed_at || null
+  };
+}
+
+function generateVoucherCode() {
+  const arr = new Uint8Array(3);
+  crypto.getRandomValues(arr);
+  const n = (arr[0] << 16) | (arr[1] << 8) | arr[2];
+  return 'CB-' + n.toString(36).toUpperCase().padStart(5, '0').slice(-5);
+}
+
+async function listVouchers(db) {
+  const rows = await all(db, 'SELECT * FROM vouchers ORDER BY created_at DESC, id DESC');
+  return rows.map(serializeVoucher);
+}
+
+async function createVoucher(request, db, user) {
+  const data = await readJson(request);
+  const name = String(data.customer_name || '').trim();
+  if (!name) throw new HttpError(400, 'Informe o nome do comprador');
+  const quantity = Math.max(1, intValue(data.quantity) || 1);
+  const unitPrice = numberValue(data.unit_price);
+  if (unitPrice <= 0) throw new HttpError(400, 'Preco invalido');
+  const paymentMethod = normalizePaymentMethod(data.payment_method || 'dinheiro');
+  const product = String(data.product || 'Combo').trim() || 'Combo';
+  const phone = String(data.customer_phone || '').trim() || null;
+  const total = unitPrice * quantity;
+
+  let code = null;
+  for (let i = 0; i < 12; i++) {
+    const candidate = generateVoucherCode();
+    const exists = await first(db, 'SELECT id FROM vouchers WHERE code = ?', candidate);
+    if (!exists) { code = candidate; break; }
+  }
+  if (!code) throw new HttpError(500, 'Nao foi possivel gerar o codigo do voucher');
+
+  const result = await run(db, `
+    INSERT INTO vouchers (code, customer_name, customer_phone, product, quantity, unit_price, total_value, payment_method, status, created_by, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pago', ?, CURRENT_TIMESTAMP)
+  `, code, name, phone, product, quantity, unitPrice, total, paymentMethod, user.username);
+  return serializeVoucher(await first(db, 'SELECT * FROM vouchers WHERE id = ?', lastRowId(result)));
+}
+
+async function getVoucherByCode(db, code) {
+  const row = await first(db, 'SELECT * FROM vouchers WHERE code = ?', String(code || '').trim().toUpperCase());
+  if (!row) throw new HttpError(404, 'Voucher nao encontrado');
+  return serializeVoucher(row);
+}
+
+async function redeemVoucher(db, id, user) {
+  const row = await first(db, 'SELECT * FROM vouchers WHERE id = ?', id);
+  if (!row) throw new HttpError(404, 'Voucher nao encontrado');
+  if (row.status === 'retirado') throw new HttpError(409, `Ja retirado em ${row.redeemed_at || 'data desconhecida'}`);
+  if (row.status === 'cancelado') throw new HttpError(409, 'Voucher cancelado');
+  await run(db, `UPDATE vouchers SET status = 'retirado', redeemed_by = ?, redeemed_at = CURRENT_TIMESTAMP WHERE id = ?`, user.username, id);
+  return serializeVoucher(await first(db, 'SELECT * FROM vouchers WHERE id = ?', id));
+}
+
+async function cancelVoucher(db, id) {
+  const row = await first(db, 'SELECT * FROM vouchers WHERE id = ?', id);
+  if (!row) throw new HttpError(404, 'Voucher nao encontrado');
+  if (row.status === 'retirado') throw new HttpError(409, 'Nao da para cancelar um voucher ja retirado');
+  await run(db, `UPDATE vouchers SET status = 'cancelado' WHERE id = ?`, id);
+  return serializeVoucher(await first(db, 'SELECT * FROM vouchers WHERE id = ?', id));
+}
+
+async function voucherSummary(db) {
+  const rows = await all(db, 'SELECT * FROM vouchers');
+  let vouchersVendidos = 0, vouchersRetirados = 0, vouchersPendentes = 0;
+  let combosVendidos = 0, combosRetirados = 0, combosPendentes = 0, arrecadado = 0;
+  for (const r of rows) {
+    if (r.status === 'cancelado') continue;
+    const q = intValue(r.quantity);
+    vouchersVendidos += 1;
+    combosVendidos += q;
+    arrecadado += numberValue(r.total_value);
+    if (r.status === 'retirado') { vouchersRetirados += 1; combosRetirados += q; }
+    else { vouchersPendentes += 1; combosPendentes += q; }
+  }
+  return {
+    vouchers_vendidos: vouchersVendidos,
+    vouchers_retirados: vouchersRetirados,
+    vouchers_pendentes: vouchersPendentes,
+    combos_vendidos: combosVendidos,
+    combos_retirados: combosRetirados,
+    combos_pendentes: combosPendentes,
+    valor_arrecadado: arrecadado
+  };
 }
 
 export async function onRequest({ request, env, params }) {

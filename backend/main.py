@@ -129,6 +129,24 @@ class SaleItem(Base):
     product = relationship("Product")
 
 
+class Voucher(Base):
+    __tablename__ = "vouchers"
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(20), unique=True, index=True)
+    customer_name = Column(String(200))
+    customer_phone = Column(String(40), nullable=True)
+    product = Column(String(100), default="Combo")
+    quantity = Column(Integer, default=1)
+    unit_price = Column(Float)
+    total_value = Column(Float)
+    payment_method = Column(String(30), default="dinheiro")
+    status = Column(String(20), default="pago")
+    created_by = Column(String(120), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    redeemed_by = Column(String(120), nullable=True)
+    redeemed_at = Column(DateTime, nullable=True)
+
+
 # --- SCHEMAS ---
 
 class UserCreate(BaseModel):
@@ -162,6 +180,14 @@ class ProductUpdate(BaseModel):
     stock: Optional[int] = None
     barcode: Optional[str] = None
     photo: Optional[str] = None
+
+class VoucherCreate(BaseModel):
+    customer_name: str
+    customer_phone: Optional[str] = None
+    quantity: int = 1
+    unit_price: float
+    payment_method: str = "dinheiro"
+    product: Optional[str] = "Combo"
 
 class CategoryCostCreate(BaseModel):
     description: str
@@ -254,6 +280,28 @@ def serialize_product(p: Product):
         "stock": p.stock,
         "photo": p.photo,
     }
+
+def serialize_voucher(v: Voucher):
+    return {
+        "id": v.id,
+        "code": v.code,
+        "customer_name": v.customer_name,
+        "customer_phone": v.customer_phone,
+        "product": v.product or "Combo",
+        "quantity": v.quantity,
+        "unit_price": v.unit_price,
+        "total_value": v.total_value,
+        "payment_method": v.payment_method,
+        "payment_method_label": PAYMENT_METHODS.get(v.payment_method, v.payment_method),
+        "status": v.status,
+        "created_by": v.created_by,
+        "created_at": v.created_at.isoformat() if v.created_at else None,
+        "redeemed_by": v.redeemed_by,
+        "redeemed_at": v.redeemed_at.isoformat() if v.redeemed_at else None,
+    }
+
+def _generate_voucher_code():
+    return "CB-" + uuid.uuid4().hex[:5].upper()
 
 def serialize_category_cost(cost: CategoryCost):
     return {
@@ -1205,6 +1253,95 @@ def sales_summary(
 @app.get("/payment-methods")
 def list_payment_methods(u: User = Depends(require_seller_or_admin)):
     return [{"value": value, "label": label} for value, label in PAYMENT_METHODS.items()]
+
+@app.get("/vouchers")
+def list_vouchers(db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    rows = db.query(Voucher).order_by(Voucher.created_at.desc(), Voucher.id.desc()).all()
+    return [serialize_voucher(v) for v in rows]
+
+@app.post("/vouchers")
+def create_voucher(payload: VoucherCreate, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    name = (payload.customer_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Informe o nome do comprador")
+    quantity = max(1, int(payload.quantity or 1))
+    unit_price = float(payload.unit_price or 0)
+    if unit_price <= 0:
+        raise HTTPException(status_code=400, detail="Preço inválido")
+    payment_method = normalize_payment_method(payload.payment_method or "dinheiro")
+    code = None
+    for _ in range(12):
+        candidate = _generate_voucher_code()
+        if not db.query(Voucher).filter(Voucher.code == candidate).first():
+            code = candidate
+            break
+    if not code:
+        raise HTTPException(status_code=500, detail="Não foi possível gerar o código do voucher")
+    v = Voucher(
+        code=code,
+        customer_name=name,
+        customer_phone=(payload.customer_phone or "").strip() or None,
+        product=(payload.product or "Combo").strip() or "Combo",
+        quantity=quantity,
+        unit_price=unit_price,
+        total_value=unit_price * quantity,
+        payment_method=payment_method,
+        status="pago",
+        created_by=u.username,
+    )
+    db.add(v); db.commit(); db.refresh(v)
+    return serialize_voucher(v)
+
+@app.get("/vouchers/summary")
+def vouchers_summary(db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    rows = db.query(Voucher).all()
+    vv = vr = vp = cv = cr = cp = 0
+    arrecadado = 0.0
+    for v in rows:
+        if v.status == "cancelado":
+            continue
+        q = int(v.quantity or 0)
+        vv += 1; cv += q; arrecadado += float(v.total_value or 0)
+        if v.status == "retirado":
+            vr += 1; cr += q
+        else:
+            vp += 1; cp += q
+    return {
+        "vouchers_vendidos": vv, "vouchers_retirados": vr, "vouchers_pendentes": vp,
+        "combos_vendidos": cv, "combos_retirados": cr, "combos_pendentes": cp,
+        "valor_arrecadado": arrecadado,
+    }
+
+@app.get("/vouchers/code/{code}")
+def get_voucher_by_code(code: str, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    v = db.query(Voucher).filter(Voucher.code == (code or "").strip().upper()).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Voucher não encontrado")
+    return serialize_voucher(v)
+
+@app.post("/vouchers/{id}/redeem")
+def redeem_voucher(id: int, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    v = db.query(Voucher).filter(Voucher.id == id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Voucher não encontrado")
+    if v.status == "retirado":
+        raise HTTPException(status_code=409, detail=f"Já retirado em {v.redeemed_at.isoformat() if v.redeemed_at else 'data desconhecida'}")
+    if v.status == "cancelado":
+        raise HTTPException(status_code=409, detail="Voucher cancelado")
+    v.status = "retirado"; v.redeemed_by = u.username; v.redeemed_at = datetime.utcnow()
+    db.commit(); db.refresh(v)
+    return serialize_voucher(v)
+
+@app.post("/vouchers/{id}/cancel")
+def cancel_voucher(id: int, db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    v = db.query(Voucher).filter(Voucher.id == id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Voucher não encontrado")
+    if v.status == "retirado":
+        raise HTTPException(status_code=409, detail="Não dá para cancelar um voucher já retirado")
+    v.status = "cancelado"
+    db.commit(); db.refresh(v)
+    return serialize_voucher(v)
 
 @app.get("/health")
 def health_check():

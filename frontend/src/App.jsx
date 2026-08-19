@@ -9,7 +9,7 @@ import {
   DialogContent, DialogActions, Badge, Chip, Autocomplete,
   BottomNavigation, BottomNavigationAction, Fab, Drawer,
   useMediaQuery, useTheme, Divider, LinearProgress, Switch,
-  FormControlLabel
+  FormControlLabel, CircularProgress
 } from '@mui/material';
 
 import {
@@ -17,7 +17,8 @@ import {
   Logout, Storefront, Edit, Delete, Search, TrendingUp, Storage,
   AdminPanelSettings, Remove, Download, PointOfSale, QrCodeScanner,
   CameraAlt, UploadFile, Close, People, CloudUpload,
-  PhotoCamera, ContentCopy, ManageSearch, QrCode2
+  PhotoCamera, ContentCopy, ManageSearch, QrCode2, CheckCircle, AccessTime,
+  ConfirmationNumber, Share, Fastfood
 } from '@mui/icons-material';
 
 import QRCode from 'qrcode';
@@ -47,6 +48,13 @@ const PIX_CONFIG = {
   cidade: 'Natal'                                   // cidade do recebedor
 };
 const pixConfigured = () => PIX_CONFIG.chave && PIX_CONFIG.chave !== 'SUA_CHAVE_PIX_AQUI';
+
+// PIX automático via PagBank: só ligar quando a conta estiver liberada na whitelist de produção.
+// Enquanto false, o "Cobrar via PIX" usa o QR estático com confirmação manual.
+const PIX_AUTO_ENABLED = false;
+
+// Preço padrão do combo na pré-venda (antecipado). Editável na hora de registrar.
+const COMBO_PRESALE_PRICE = 30;
 
 // Monta um campo EMV (id + tamanho + valor) do padrão BR Code
 function pixField(id, value) {
@@ -279,8 +287,19 @@ function App() {
   const [selectedCustomer, setSelectedCustomer] = useState('');
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('dinheiro');
   const [loginError, setLoginError] = useState('');
-  const [pixDialog, setPixDialog] = useState({ open: false, qr: '', payload: '', valor: 0 });
+  // status: 'loading' | 'waiting' (aguardando pagto automatico) | 'manual' (fallback QR estatico) | 'paid' | 'expired'
+  const [pixDialog, setPixDialog] = useState({ open: false, status: 'loading', valor: 0, orderId: '', qrText: '', qrImage: '', expiresAt: 0 });
+  const [pixNow, setPixNow] = useState(0);
   const [stockQuery, setStockQuery] = useState('');
+
+  // Pré-venda (vouchers)
+  const [vouchers, setVouchers] = useState([]);
+  const [voucherSummaryData, setVoucherSummaryData] = useState(null);
+  const [openVoucherDialog, setOpenVoucherDialog] = useState(false);
+  const [voucherForm, setVoucherForm] = useState({ customer_name: '', customer_phone: '', quantity: 1, unit_price: COMBO_PRESALE_PRICE, payment_method: 'dinheiro' });
+  const [voucherResult, setVoucherResult] = useState({ open: false, voucher: null, qr: '' });
+  const [redeemDialog, setRedeemDialog] = useState({ open: false, voucher: null });
+  const [voucherCodeInput, setVoucherCodeInput] = useState('');
 
   const [daysFilter, setDaysFilter] = useState(7);
   const [productFilter, setProductFilter] = useState(null);
@@ -443,6 +462,42 @@ function App() {
     return () => window.clearInterval(intervalId);
   }, [token, tabValue, fetchData]);
 
+  // Carrega os vouchers ao abrir a aba Pré-venda
+  useEffect(() => {
+    if (!token || tabValue !== 'prevenda') return undefined;
+    fetchVouchers();
+    return undefined;
+  }, [token, tabValue, fetchVouchers]);
+
+  // PIX automático: consulta o PagBank a cada 4s e faz a contagem regressiva do QR
+  useEffect(() => {
+    if (!pixDialog.open || pixDialog.status !== 'waiting' || !pixDialog.orderId) return undefined;
+    let active = true;
+    const poll = async () => {
+      try {
+        const { data } = await api.get(`/pix/charge/${encodeURIComponent(pixDialog.orderId)}`);
+        if (active && data.paid) setPixDialog(prev => ({ ...prev, status: 'paid' }));
+      } catch { /* ignora erro transitório de rede */ }
+    };
+    const pollId = window.setInterval(poll, 4000);
+    const tickId = window.setInterval(() => {
+      setPixNow(Date.now());
+      if (Date.now() > pixDialog.expiresAt) {
+        setPixDialog(prev => (prev.status === 'waiting' ? { ...prev, status: 'expired' } : prev));
+      }
+    }, 1000);
+    poll();
+    return () => { active = false; window.clearInterval(pollId); window.clearInterval(tickId); };
+  }, [pixDialog.open, pixDialog.status, pixDialog.orderId, pixDialog.expiresAt]);
+
+  // Quando o pagamento é confirmado, mostra o ✓ e finaliza a venda automaticamente
+  useEffect(() => {
+    if (pixDialog.status !== 'paid') return undefined;
+    const t = window.setTimeout(() => { finalizePixSale(pixDialog.orderId); }, 1600);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pixDialog.status]);
+
   const handleLogin = async () => {
     if (!securityConfigLoaded) return showFeedback('Carregando verificacao de seguranca', 'info');
     if (turnstileMisconfigured) return showFeedback('Turnstile nao configurado corretamente no Cloudflare', 'error');
@@ -509,6 +564,16 @@ function App() {
     if (scanTarget === 'editProduct') {
       setEditProductData(prev => ({ ...prev, barcode: code }));
       showFeedback(`Código lido: ${code}`, 'info');
+      return;
+    }
+    if (scanTarget === 'voucher') {
+      const c = String(code || '').trim().toUpperCase();
+      try {
+        const { data } = await api.get(`/vouchers/code/${encodeURIComponent(c)}`);
+        setRedeemDialog({ open: true, voucher: data });
+      } catch {
+        showFeedback(`Voucher não encontrado: ${c}`, 'warning');
+      }
       return;
     }
     try {
@@ -635,25 +700,172 @@ function App() {
     }
   };
 
-  // Abre o QR PIX com o valor exato do carrinho (antes de finalizar a venda)
-  const handleShowPix = async () => {
+  // Fallback: gera o QR estático local (confirmação manual) quando o PagBank não está disponível
+  const openPixStaticFallback = async (reason) => {
+    if (!pixConfigured()) {
+      setPixDialog(prev => ({ ...prev, open: false }));
+      return showFeedback('PIX indisponível: configure o PagBank ou a chave estática.', 'error');
+    }
+    const payload = buildPixPayload({ ...PIX_CONFIG, valor: cartTotal });
+    const qr = await QRCode.toDataURL(payload, { width: 300, margin: 1 });
+    setPixDialog({ open: true, status: 'manual', valor: cartTotal, orderId: '', qrText: payload, qrImage: qr, expiresAt: 0, note: reason || '' });
+  };
+
+  // Inicia a cobrança PIX automática via PagBank (com fallback para o QR estático)
+  const startPixCharge = async () => {
+    if (!selectedCustomer) return showFeedback('Selecione cliente!', 'warning');
     if (cart.length === 0) return showFeedback('Carrinho vazio!', 'warning');
-    if (!pixConfigured()) return showFeedback('Chave PIX ainda não configurada no sistema.', 'warning');
+    // Enquanto o PagBank não liberar a whitelist de produção, usa direto o QR manual (sem chamada que falha)
+    if (!PIX_AUTO_ENABLED) return openPixStaticFallback();
+    setPixDialog({ open: true, status: 'loading', valor: cartTotal, orderId: '', qrText: '', qrImage: '', expiresAt: 0 });
     try {
-      const payload = buildPixPayload({ ...PIX_CONFIG, valor: cartTotal });
-      const qr = await QRCode.toDataURL(payload, { width: 320, margin: 1 });
-      setPixDialog({ open: true, qr, payload, valor: cartTotal });
-    } catch {
-      showFeedback('Erro ao gerar QR do PIX.', 'error');
+      const custObj = customers.find(c => c.id === parseInt(selectedCustomer));
+      const { data } = await api.post('/pix/charge', {
+        amount: cartTotal,
+        customer_name: custObj?.name,
+        reference_id: `venda-${Date.now()}`
+      });
+      const qr = data.qr_text ? await QRCode.toDataURL(data.qr_text, { width: 300, margin: 1 }) : (data.qr_image || '');
+      setPixDialog({
+        open: true,
+        status: 'waiting',
+        valor: cartTotal,
+        orderId: data.order_id || '',
+        qrText: data.qr_text || '',
+        qrImage: qr,
+        expiresAt: data.expiration ? new Date(data.expiration).getTime() : (Date.now() + 15 * 60 * 1000)
+      });
+    } catch (err) {
+      // PagBank indisponível/não configurado → cai no QR estático com confirmação manual
+      await openPixStaticFallback(err.response?.data?.detail || 'Falha ao falar com o PagBank');
+    }
+  };
+
+  // Registra a venda de PIX confirmada (automática ou manual)
+  const finalizePixSale = async (orderId) => {
+    try {
+      const items = cart.map((p) => ({ product_id: p.id, quantity: p.quantity }));
+      await api.post('/sales/', {
+        customer_id: parseInt(selectedCustomer),
+        items,
+        is_paid: true,
+        payment_method: 'pix',
+        payment_provider: orderId ? 'pagbank' : null,
+        payment_reference: orderId || null
+      });
+      showFeedback('Pagamento PIX confirmado!', 'success');
+      setCart([]);
+      setCartOpen(false);
+      setPixDialog(prev => ({ ...prev, open: false }));
+      fetchData();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Pago, mas houve erro ao registrar a venda.', 'error');
     }
   };
 
   const handleCopyPix = async () => {
     try {
-      await navigator.clipboard.writeText(pixDialog.payload);
+      await navigator.clipboard.writeText(pixDialog.qrText);
       showFeedback('Código PIX copiado!', 'success');
     } catch {
       showFeedback('Não foi possível copiar. Copie manualmente.', 'warning');
+    }
+  };
+
+  // ===== Pré-venda (vouchers) =====
+  const fetchVouchers = useCallback(async () => {
+    try {
+      const [listRes, sumRes] = await Promise.all([api.get('/vouchers'), api.get('/vouchers/summary')]);
+      setVouchers(listRes.data);
+      setVoucherSummaryData(sumRes.data);
+    } catch { /* silencioso */ }
+  }, []);
+
+  const handleCreateVoucher = async () => {
+    const name = voucherForm.customer_name.trim();
+    if (!name) return showFeedback('Informe o nome do comprador', 'warning');
+    const qty = parseInt(voucherForm.quantity || 1);
+    const price = parseFloat(voucherForm.unit_price || 0);
+    if (!qty || qty < 1) return showFeedback('Quantidade inválida', 'warning');
+    if (!price || price <= 0) return showFeedback('Preço inválido', 'warning');
+    try {
+      const { data } = await api.post('/vouchers', {
+        customer_name: name,
+        customer_phone: voucherForm.customer_phone.trim(),
+        quantity: qty,
+        unit_price: price,
+        payment_method: voucherForm.payment_method,
+        product: 'Combo'
+      });
+      const qr = await QRCode.toDataURL(data.code, { width: 320, margin: 1 });
+      setOpenVoucherDialog(false);
+      setVoucherForm({ customer_name: '', customer_phone: '', quantity: 1, unit_price: COMBO_PRESALE_PRICE, payment_method: 'dinheiro' });
+      setVoucherResult({ open: true, voucher: data, qr });
+      fetchVouchers();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao gerar voucher', 'error');
+    }
+  };
+
+  const openVoucherQr = async (voucher) => {
+    const qr = await QRCode.toDataURL(voucher.code, { width: 320, margin: 1 });
+    setVoucherResult({ open: true, voucher, qr });
+  };
+
+  const handleShareVoucher = async () => {
+    const v = voucherResult.voucher;
+    if (!v) return;
+    const msg = `Voucher ${v.code} — ${v.quantity} ${v.product}. Apresente este QR Code na retirada. Mercadinho Caminhar.`;
+    try {
+      const blob = await (await fetch(voucherResult.qr)).blob();
+      const file = new File([blob], `voucher-${v.code}.png`, { type: 'image/png' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], text: msg });
+        return;
+      }
+      if (navigator.share) { await navigator.share({ text: msg }); return; }
+      await navigator.clipboard.writeText(v.code);
+      showFeedback('Compartilhamento não suportado neste aparelho. Código copiado.', 'info');
+    } catch { /* usuário cancelou o compartilhamento */ }
+  };
+
+  const handleRedeemLookup = async (code) => {
+    const c = String(code || '').trim().toUpperCase();
+    if (!c) return;
+    try {
+      const { data } = await api.get(`/vouchers/code/${encodeURIComponent(c)}`);
+      setRedeemDialog({ open: true, voucher: data });
+      setVoucherCodeInput('');
+    } catch {
+      showFeedback(`Voucher não encontrado: ${c}`, 'warning');
+    }
+  };
+
+  const handleRedeem = async () => {
+    const v = redeemDialog.voucher;
+    if (!v) return;
+    try {
+      const { data } = await api.post(`/vouchers/${v.id}/redeem`);
+      setRedeemDialog({ open: true, voucher: data });
+      showFeedback('Baixa registrada!', 'success');
+      fetchVouchers();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao dar baixa', 'error');
+      try {
+        const { data } = await api.get(`/vouchers/code/${encodeURIComponent(v.code)}`);
+        setRedeemDialog({ open: true, voucher: data });
+      } catch { /* mantém o estado atual */ }
+    }
+  };
+
+  const handleCancelVoucher = async (id) => {
+    if (!window.confirm('Cancelar este voucher? Esta ação não pode ser desfeita.')) return;
+    try {
+      await api.post(`/vouchers/${id}/cancel`);
+      showFeedback('Voucher cancelado', 'info');
+      fetchVouchers();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao cancelar', 'error');
     }
   };
 
@@ -1068,11 +1280,6 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           {paymentMethods.map((method) => <MenuItem key={method.value} value={method.value}>{method.label}</MenuItem>)}
         </Select>
       </FormControl>
-      {selectedPaymentMethod === 'pix' && (
-        <Button fullWidth variant="outlined" color="success" startIcon={<QrCode2 />} onClick={handleShowPix} disabled={cart.length === 0} sx={{ mb: 2 }}>
-          Mostrar QR do PIX (R$ {formatCurrency(cartTotal)})
-        </Button>
-      )}
       <List dense sx={{ maxHeight: isMobile ? '40vh' : 260, overflow: 'auto', bgcolor: '#fafafa', mb: 2, p: 0 }}>
         {cart.map((item) => (
           <ListItem key={item.id} disableGutters sx={{ display: 'block', px: 1, py: 1.25, borderBottom: '1px solid #e0e0e0', '&:last-child': { borderBottom: 0 } }}>
@@ -1095,8 +1302,15 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         {cart.length === 0 && <Typography variant="body2" color="text.secondary" sx={{ p: 2, textAlign: 'center' }}>Carrinho vazio</Typography>}
       </List>
       <Typography variant="h5" align="right" sx={{ fontWeight: 'bold', mb: 2 }}>Total: R$ {formatCurrency(cartTotal)}</Typography>
-      <Button fullWidth variant="contained" color={selectedPaymentMethod === 'fiado' ? 'warning' : 'success'} onClick={() => handleFinishSale(selectedPaymentMethod !== 'fiado')} disabled={cart.length === 0}>
-        {selectedPaymentMethod === 'fiado' ? 'Anotar Fiado' : 'Finalizar Venda'}
+      <Button
+        fullWidth
+        variant="contained"
+        color={selectedPaymentMethod === 'fiado' ? 'warning' : 'success'}
+        startIcon={selectedPaymentMethod === 'pix' ? <QrCode2 /> : null}
+        onClick={() => selectedPaymentMethod === 'pix' ? startPixCharge() : handleFinishSale(selectedPaymentMethod !== 'fiado')}
+        disabled={cart.length === 0}
+      >
+        {selectedPaymentMethod === 'fiado' ? 'Anotar Fiado' : selectedPaymentMethod === 'pix' ? 'Cobrar via PIX' : 'Finalizar Venda'}
       </Button>
     </Box>
   );
@@ -1116,6 +1330,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           <Tabs value={tabValue} onChange={(e, v) => setTabValue(v)} textColor="inherit" indicatorColor="secondary" centered>
             {isAdmin && <Tab value="resumo" label="Resumo" icon={<Assessment />} />}
             <Tab value="vender" label="Vender" icon={<ShoppingCart />} />
+            <Tab value="prevenda" label="Pré-venda" icon={<ConfirmationNumber />} />
             <Tab value="consulta" label="Consulta" icon={<ManageSearch />} />
             <Tab value="clientes" label="Clientes" icon={<People />} />
             <Tab value="estoque" label="Estoque" icon={<Inventory />} />
@@ -1253,6 +1468,82 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Paper>
             </Grid>
           </Grid>
+        )}
+
+        {/* === ABA PRÉ-VENDA (vouchers de combo com QR) === */}
+        {tabValue === 'prevenda' && (
+          <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
+            <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
+              <Typography variant="h5">Pré-venda de Combos</Typography>
+              <Box display="flex" gap={1} flexWrap="wrap">
+                <Button variant="contained" color="success" startIcon={<QrCodeScanner />} onClick={() => openScanner('voucher')} size={isMobile ? 'small' : 'medium'}>
+                  Retirar (escanear)
+                </Button>
+                <Button variant="contained" startIcon={<Add />} onClick={() => { setVoucherForm({ customer_name: '', customer_phone: '', quantity: 1, unit_price: COMBO_PRESALE_PRICE, payment_method: 'dinheiro' }); setOpenVoucherDialog(true); }} size={isMobile ? 'small' : 'medium'}>
+                  Nova pré-venda
+                </Button>
+              </Box>
+            </Box>
+
+            {voucherSummaryData && (
+              <Grid container spacing={1} sx={{ mb: 2 }}>
+                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#1a237e">{voucherSummaryData.combos_vendidos}</Typography><Typography variant="caption" color="text.secondary">combos vendidos</Typography></Paper></Grid>
+                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#ef6c00">{voucherSummaryData.combos_pendentes}</Typography><Typography variant="caption" color="text.secondary">a retirar</Typography></Paper></Grid>
+                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#2e7d32">{voucherSummaryData.combos_retirados}</Typography><Typography variant="caption" color="text.secondary">retirados</Typography></Paper></Grid>
+                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h6" fontWeight="900" color="#2e7d32">R$ {formatCurrency(voucherSummaryData.valor_arrecadado)}</Typography><Typography variant="caption" color="text.secondary">arrecadado</Typography></Paper></Grid>
+              </Grid>
+            )}
+
+            <Paper sx={{ p: 1.5, mb: 2 }}>
+              <Box display="flex" gap={1} alignItems="center">
+                <TextField fullWidth size="small" placeholder="Digitar código do voucher (ex: CB-XXXX)" value={voucherCodeInput} onChange={(e) => setVoucherCodeInput(e.target.value.toUpperCase())} onKeyDown={(e) => e.key === 'Enter' && handleRedeemLookup(voucherCodeInput)} />
+                <Button variant="outlined" onClick={() => handleRedeemLookup(voucherCodeInput)} disabled={!voucherCodeInput.trim()}>Buscar</Button>
+              </Box>
+            </Paper>
+
+            <TableContainer component={Paper}>
+              <Table size="small">
+                <TableHead sx={{ bgcolor: '#eee' }}>
+                  <TableRow>
+                    <TableCell>Código</TableCell>
+                    <TableCell>Comprador</TableCell>
+                    <TableCell align="center">Qtd</TableCell>
+                    {!isMobile && <TableCell align="right">Total</TableCell>}
+                    <TableCell align="center">Status</TableCell>
+                    <TableCell align="center">Ações</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {vouchers.map((v) => (
+                    <TableRow key={v.id}>
+                      <TableCell><Typography variant="body2" fontWeight="bold">{v.code}</Typography></TableCell>
+                      <TableCell>
+                        {v.customer_name}
+                        {isMobile && <Typography variant="caption" display="block" color="text.secondary">{v.quantity}x · R$ {formatCurrency(v.total_value)}</Typography>}
+                      </TableCell>
+                      <TableCell align="center">{v.quantity}</TableCell>
+                      {!isMobile && <TableCell align="right">R$ {formatCurrency(v.total_value)}</TableCell>}
+                      <TableCell align="center">
+                        <Chip
+                          size="small"
+                          label={v.status === 'retirado' ? 'Retirado' : v.status === 'cancelado' ? 'Cancelado' : 'A retirar'}
+                          color={v.status === 'retirado' ? 'success' : v.status === 'cancelado' ? 'default' : 'warning'}
+                          variant={v.status === 'pago' ? 'outlined' : 'filled'}
+                        />
+                      </TableCell>
+                      <TableCell align="center">
+                        <IconButton size="small" color="primary" onClick={() => openVoucherQr(v)} title="Ver/enviar QR"><QrCode2 /></IconButton>
+                        {isAdmin && v.status !== 'retirado' && v.status !== 'cancelado' && (
+                          <IconButton size="small" color="error" onClick={() => handleCancelVoucher(v.id)} title="Cancelar"><Delete /></IconButton>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!vouchers.length && <TableRow><TableCell colSpan={isMobile ? 5 : 6} align="center" sx={{ py: 3 }}>Nenhuma pré-venda registrada ainda.</TableCell></TableRow>}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </Container>
         )}
 
         {/* === ABA CONSULTA (estoque em tempo real, todos os perfis) === */}
@@ -1553,14 +1844,21 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             value={tabValue}
             onChange={(e, v) => setTabValue(v)}
             showLabels
-            sx={{ position: 'fixed', bottom: 0, left: 0, right: 0, zIndex: 1200, borderTop: '1px solid #ddd' }}
+            sx={{
+              position: 'fixed', bottom: 0, left: 0, right: 0, zIndex: 1200, borderTop: '1px solid #ddd',
+              overflowX: 'auto', justifyContent: 'flex-start',
+              '&::-webkit-scrollbar': { display: 'none' }, scrollbarWidth: 'none',
+              '& .MuiBottomNavigationAction-root': { minWidth: 68, flexShrink: 0, px: 0.5 },
+              '& .MuiBottomNavigationAction-label': { fontSize: '0.68rem', whiteSpace: 'nowrap' }
+            }}
           >
             {isAdmin && <BottomNavigationAction label="Resumo" value="resumo" icon={<Assessment />} />}
             <BottomNavigationAction label="Vender" value="vender" icon={<ShoppingCart />} />
+            <BottomNavigationAction label="Pré-venda" value="prevenda" icon={<ConfirmationNumber />} />
             <BottomNavigationAction label="Consulta" value="consulta" icon={<ManageSearch />} />
             <BottomNavigationAction label="Clientes" value="clientes" icon={<People />} />
             <BottomNavigationAction label="Estoque" value="estoque" icon={<Inventory />} />
-            {isAdmin && <BottomNavigationAction label="Users" value="usuarios" icon={<AdminPanelSettings />} />}
+            {isAdmin && <BottomNavigationAction label="Usuários" value="usuarios" icon={<AdminPanelSettings />} />}
           </BottomNavigation>
 
           {tabValue === 'vender' && (
@@ -1800,34 +2098,166 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         </Dialog>
       )}
 
-      {/* QR Code PIX */}
-      <Dialog open={pixDialog.open} onClose={() => setPixDialog(prev => ({ ...prev, open: false }))} fullWidth maxWidth="xs">
+      {/* Cobrança PIX */}
+      <Dialog open={pixDialog.open} onClose={() => pixDialog.status !== 'paid' && setPixDialog(prev => ({ ...prev, open: false }))} fullWidth maxWidth="xs">
         <DialogTitle sx={{ textAlign: 'center' }}>Pagamento via PIX</DialogTitle>
         <DialogContent sx={{ textAlign: 'center' }}>
-          <Typography variant="h5" fontWeight="900" color="#2e7d32" gutterBottom>R$ {formatCurrency(pixDialog.valor)}</Typography>
-          {pixDialog.qr && <Box component="img" src={pixDialog.qr} alt="QR Code PIX" sx={{ width: 240, maxWidth: '100%', mx: 'auto', display: 'block' }} />}
-          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
-            Aponte a câmera do app do banco ou use o Pix Copia e Cola abaixo.
-          </Typography>
-          <TextField
-            value={pixDialog.payload}
-            fullWidth
-            multiline
-            maxRows={3}
-            size="small"
-            InputProps={{ readOnly: true }}
-            sx={{ mt: 2 }}
-            onFocus={(e) => e.target.select()}
-          />
-          <Button fullWidth variant="outlined" startIcon={<ContentCopy />} onClick={handleCopyPix} sx={{ mt: 1 }}>
-            Copiar código PIX
-          </Button>
+          {pixDialog.status === 'loading' && (
+            <Box sx={{ py: 5 }}>
+              <CircularProgress />
+              <Typography sx={{ mt: 2 }} color="text.secondary">Gerando cobrança PIX...</Typography>
+            </Box>
+          )}
+
+          {pixDialog.status === 'paid' && (
+            <Box sx={{ py: 5 }}>
+              <CheckCircle sx={{ fontSize: 90, color: '#2e7d32' }} />
+              <Typography variant="h6" fontWeight="bold" color="#2e7d32" sx={{ mt: 1 }}>Pagamento confirmado!</Typography>
+              <Typography color="text.secondary">R$ {formatCurrency(pixDialog.valor)} recebido via PIX.</Typography>
+            </Box>
+          )}
+
+          {pixDialog.status === 'expired' && (
+            <Box sx={{ py: 4 }}>
+              <AccessTime sx={{ fontSize: 70, color: '#c62828' }} />
+              <Typography variant="h6" fontWeight="bold" sx={{ mt: 1 }}>Tempo esgotado</Typography>
+              <Typography color="text.secondary">O QR expirou. Gere um novo para o cliente pagar.</Typography>
+            </Box>
+          )}
+
+          {(pixDialog.status === 'waiting' || pixDialog.status === 'manual') && (
+            <>
+              <Typography variant="h5" fontWeight="900" color="#2e7d32" gutterBottom>R$ {formatCurrency(pixDialog.valor)}</Typography>
+              {pixDialog.qrImage && <Box component="img" src={pixDialog.qrImage} alt="QR Code PIX" sx={{ width: 230, maxWidth: '100%', mx: 'auto', display: 'block' }} />}
+              {pixDialog.status === 'waiting' && (
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1, mt: 1, color: '#ef6c00' }}>
+                  <CircularProgress size={16} color="inherit" />
+                  <Typography variant="body2">
+                    Aguardando pagamento · expira em {(() => {
+                      const s = Math.max(0, Math.ceil((pixDialog.expiresAt - (pixNow || Date.now())) / 1000));
+                      return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+                    })()}
+                  </Typography>
+                </Box>
+              )}
+              {pixDialog.status === 'manual' && (
+                <Alert severity="info" sx={{ mt: 1, textAlign: 'left' }}>
+                  Confira o recebimento no app do banco e toque em "Recebido".
+                  {pixDialog.note && <Typography variant="caption" display="block" sx={{ mt: 0.5, opacity: 0.8 }}>Motivo: {pixDialog.note}</Typography>}
+                </Alert>
+              )}
+              <TextField
+                value={pixDialog.qrText}
+                fullWidth multiline maxRows={3} size="small"
+                InputProps={{ readOnly: true }}
+                sx={{ mt: 2 }}
+                onFocus={(e) => e.target.select()}
+              />
+              <Button fullWidth variant="outlined" startIcon={<ContentCopy />} onClick={handleCopyPix} sx={{ mt: 1 }}>
+                Copiar código PIX
+              </Button>
+            </>
+          )}
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2, flexDirection: 'column', gap: 1 }}>
-          <Button fullWidth variant="contained" color="success" onClick={() => { setPixDialog(prev => ({ ...prev, open: false })); handleFinishSale(true); }}>
-            Recebido — Finalizar venda
-          </Button>
-          <Button fullWidth onClick={() => setPixDialog(prev => ({ ...prev, open: false }))}>Cancelar</Button>
+          {pixDialog.status === 'manual' && (
+            <Button fullWidth variant="contained" color="success" onClick={() => finalizePixSale('')}>
+              Recebido — Finalizar venda
+            </Button>
+          )}
+          {pixDialog.status === 'waiting' && (
+            <Button fullWidth variant="text" color="success" onClick={() => finalizePixSale(pixDialog.orderId)}>
+              Já recebi — confirmar manualmente
+            </Button>
+          )}
+          {pixDialog.status === 'expired' && (
+            <Button fullWidth variant="contained" onClick={startPixCharge}>Gerar novo QR</Button>
+          )}
+          {pixDialog.status !== 'paid' && (
+            <Button fullWidth onClick={() => setPixDialog(prev => ({ ...prev, open: false }))}>Cancelar</Button>
+          )}
+        </DialogActions>
+      </Dialog>
+
+      {/* Nova pré-venda */}
+      <Dialog open={openVoucherDialog} onClose={() => setOpenVoucherDialog(false)} fullWidth maxWidth="xs">
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><Fastfood /> Nova pré-venda de combo</DialogTitle>
+        <DialogContent sx={{ pt: 2 }}>
+          <TextField autoFocus margin="dense" label="Nome do comprador" fullWidth value={voucherForm.customer_name} onChange={(e) => setVoucherForm({ ...voucherForm, customer_name: e.target.value })} />
+          <TextField margin="dense" label="Telefone (opcional)" fullWidth value={voucherForm.customer_phone} onChange={(e) => setVoucherForm({ ...voucherForm, customer_phone: e.target.value })} sx={{ mt: 1 }} />
+          <Box display="flex" gap={2} mt={2}>
+            <TextField label="Qtd de combos" type="number" fullWidth value={voucherForm.quantity} onChange={(e) => setVoucherForm({ ...voucherForm, quantity: e.target.value })} inputProps={{ min: 1 }} />
+            <TextField label="Preço unitário" type="number" fullWidth value={voucherForm.unit_price} onChange={(e) => setVoucherForm({ ...voucherForm, unit_price: e.target.value })} helperText="Padrão R$ 30" />
+          </Box>
+          <FormControl fullWidth margin="dense" sx={{ mt: 2 }}>
+            <InputLabel>Pagamento</InputLabel>
+            <Select label="Pagamento" value={voucherForm.payment_method} onChange={(e) => setVoucherForm({ ...voucherForm, payment_method: e.target.value })}>
+              {paymentMethods.filter(m => m.value !== 'fiado').map((m) => <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>)}
+            </Select>
+          </FormControl>
+          <Typography variant="h6" align="right" sx={{ mt: 2 }} color="#2e7d32" fontWeight="bold">
+            Total: R$ {formatCurrency((parseFloat(voucherForm.unit_price || 0)) * (parseInt(voucherForm.quantity || 0) || 0))}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenVoucherDialog(false)}>Cancelar</Button>
+          <Button onClick={handleCreateVoucher} variant="contained">Gerar voucher</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* QR do voucher (mostrar/enviar) */}
+      <Dialog open={voucherResult.open} onClose={() => setVoucherResult({ open: false, voucher: null, qr: '' })} fullWidth maxWidth="xs">
+        <DialogTitle sx={{ textAlign: 'center' }}>Voucher gerado</DialogTitle>
+        <DialogContent sx={{ textAlign: 'center' }}>
+          {voucherResult.voucher && (
+            <>
+              <Typography variant="h5" fontWeight="900" color="#1a237e">{voucherResult.voucher.code}</Typography>
+              <Typography variant="body2" color="text.secondary" gutterBottom>
+                {voucherResult.voucher.customer_name} · {voucherResult.voucher.quantity}x {voucherResult.voucher.product} · R$ {formatCurrency(voucherResult.voucher.total_value)}
+              </Typography>
+              {voucherResult.qr && <Box component="img" src={voucherResult.qr} alt="QR do voucher" sx={{ width: 240, maxWidth: '100%', mx: 'auto', display: 'block' }} />}
+              <Alert severity="info" sx={{ mt: 1, textAlign: 'left' }}>
+                Envie este QR ao comprador. Ele apresenta na retirada, e o vendedor escaneia para dar baixa.
+              </Alert>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, flexDirection: 'column', gap: 1 }}>
+          <Button fullWidth variant="contained" startIcon={<Share />} onClick={handleShareVoucher}>Enviar QR ao comprador</Button>
+          <Button fullWidth onClick={() => setVoucherResult({ open: false, voucher: null, qr: '' })}>Fechar</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Retirada / baixa do voucher */}
+      <Dialog open={redeemDialog.open} onClose={() => setRedeemDialog({ open: false, voucher: null })} fullWidth maxWidth="xs">
+        <DialogTitle sx={{ textAlign: 'center' }}>Retirada do combo</DialogTitle>
+        <DialogContent sx={{ textAlign: 'center' }}>
+          {redeemDialog.voucher && (
+            <>
+              <Typography variant="h5" fontWeight="900" color="#1a237e">{redeemDialog.voucher.code}</Typography>
+              <Typography variant="h6" sx={{ mt: 1 }}>{redeemDialog.voucher.customer_name}</Typography>
+              <Typography variant="h4" fontWeight="900" sx={{ my: 1 }}>{redeemDialog.voucher.quantity} <Typography component="span" variant="body1">{redeemDialog.voucher.product}(s)</Typography></Typography>
+              {redeemDialog.voucher.status === 'pago' && (
+                <Alert severity="success" icon={<CheckCircle />} sx={{ justifyContent: 'center', mb: 1 }}>PAGO · pronto para entregar</Alert>
+              )}
+              {redeemDialog.voucher.status === 'retirado' && (
+                <Alert severity="error" sx={{ textAlign: 'left', mb: 1 }}>
+                  ⚠️ Já retirado em {redeemDialog.voucher.redeemed_at}{redeemDialog.voucher.redeemed_by ? ` por ${redeemDialog.voucher.redeemed_by}` : ''}.
+                </Alert>
+              )}
+              {redeemDialog.voucher.status === 'cancelado' && (
+                <Alert severity="warning" sx={{ mb: 1 }}>Este voucher foi cancelado.</Alert>
+              )}
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, flexDirection: 'column', gap: 1 }}>
+          {redeemDialog.voucher && redeemDialog.voucher.status === 'pago' && (
+            <Button fullWidth variant="contained" color="success" size="large" startIcon={<CheckCircle />} onClick={handleRedeem}>
+              Entregar — dar baixa
+            </Button>
+          )}
+          <Button fullWidth onClick={() => setRedeemDialog({ open: false, voucher: null })}>Fechar</Button>
         </DialogActions>
       </Dialog>
 
