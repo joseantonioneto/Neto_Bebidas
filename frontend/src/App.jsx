@@ -2276,8 +2276,22 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
       <Dialog open={openVoucherDialog} onClose={() => setOpenVoucherDialog(false)} fullWidth maxWidth="xs">
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><Fastfood /> Nova pré-venda de combo</DialogTitle>
         <DialogContent sx={{ pt: 2 }}>
-          <TextField autoFocus margin="dense" label="Nome do comprador" fullWidth value={voucherForm.customer_name} onChange={(e) => setVoucherForm({ ...voucherForm, customer_name: e.target.value })} />
-          <TextField margin="dense" label="Telefone (opcional)" fullWidth value={voucherForm.customer_phone} onChange={(e) => setVoucherForm({ ...voucherForm, customer_phone: e.target.value })} sx={{ mt: 1 }} />
+          <Autocomplete
+            freeSolo
+            autoHighlight
+            options={customers}
+            getOptionLabel={(o) => (typeof o === 'string' ? o : o.name)}
+            isOptionEqualToValue={(o, v) => (o?.name || o) === (v?.name || v)}
+            value={voucherForm.customer_name}
+            onChange={(e, v) => {
+              if (v && typeof v === 'object') setVoucherForm(prev => ({ ...prev, customer_name: v.name, customer_phone: v.phone || '' }));
+              else setVoucherForm(prev => ({ ...prev, customer_name: v || '' }));
+            }}
+            onInputChange={(e, val, reason) => { if (reason === 'input') setVoucherForm(prev => ({ ...prev, customer_name: val })); }}
+            renderOption={(props, o) => (<li {...props} key={o.id}>{o.name}{o.phone ? ` — ${o.phone}` : ''}</li>)}
+            renderInput={(params) => (<TextField {...params} autoFocus margin="dense" label="Cliente (comprador)" placeholder="Selecione da lista ou digite um novo..." helperText="Escolha um cliente cadastrado — nome e telefone vêm da lista." />)}
+          />
+          <TextField margin="dense" label="Telefone" fullWidth value={voucherForm.customer_phone} onChange={(e) => setVoucherForm({ ...voucherForm, customer_phone: e.target.value })} sx={{ mt: 1 }} />
           <Box display="flex" gap={2} mt={2}>
             <TextField label="Qtd de combos" type="number" fullWidth value={voucherForm.quantity} onChange={(e) => setVoucherForm({ ...voucherForm, quantity: e.target.value })} inputProps={{ min: 1 }} />
             <TextField label="Preço unitário" type="number" fullWidth value={voucherForm.unit_price} onChange={(e) => setVoucherForm({ ...voucherForm, unit_price: e.target.value })} helperText="Padrão R$ 30" />
