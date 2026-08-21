@@ -378,6 +378,7 @@ function App() {
   const [newClientName, setNewClientName] = useState('');
   const [newClientPhone, setNewClientPhone] = useState('');
   const [newClientGroup, setNewClientGroup] = useState('Caminhar Cristo Rei');
+  const [clientSort, setClientSort] = useState('nome'); // 'nome' | 'grupo'
 
   const [openProductDialog, setOpenProductDialog] = useState(false);
   const [openEditProductDialog, setOpenEditProductDialog] = useState(false);
@@ -711,7 +712,18 @@ function App() {
   const cartTotal = cart.reduce((sum, item) => sum + (item.sell_price * item.quantity), 0);
   const categoryOptions = [...new Set(products.map((p) => p.category || 'Geral'))].sort();
 
-  const filteredCustomers = customers.filter(c => c.name.toLowerCase().includes(searchTerm.toLowerCase())).sort((a, b) => a.name.localeCompare(b.name));
+  const filteredCustomers = customers
+    .filter(c => c.name.toLowerCase().includes(searchTerm.toLowerCase()))
+    .sort((a, b) => clientSort === 'grupo'
+      ? (a.group_name || 'zzz').localeCompare(b.group_name || 'zzz') || a.name.localeCompare(b.name)
+      : a.name.localeCompare(b.name));
+
+  // Grupos existentes (únicos) para cadastro rápido por clique
+  const customerGroups = useMemo(() => {
+    const set = new Set();
+    customers.forEach(c => { if (c.group_name) set.add(c.group_name); });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [customers]);
   const filteredProducts = products.filter(p => {
     const term = searchTermProduct.trim().toLowerCase();
     if (!term) return true;
@@ -1758,6 +1770,11 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             </Box>
             <Paper sx={{ p: 2, mb: 2 }}>
               <TextField fullWidth variant="standard" placeholder="Pesquisar..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }} />
+              <Box display="flex" alignItems="center" gap={1} mt={1.5}>
+                <Typography variant="caption" color="text.secondary">Ordenar por:</Typography>
+                <Chip label="Nome" size="small" color={clientSort === 'nome' ? 'primary' : 'default'} onClick={() => setClientSort('nome')} />
+                <Chip label="Grupo" size="small" color={clientSort === 'grupo' ? 'primary' : 'default'} onClick={() => setClientSort('grupo')} />
+              </Box>
             </Paper>
             <TableContainer component={Paper}>
               <Table size={isMobile ? "small" : "medium"}>
@@ -1982,7 +1999,18 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         <DialogContent sx={{ pt: 2, display: 'flex', flexDirection: 'column', gap: 2 }}>
           <TextField autoFocus label="Nome" fullWidth value={newClientName} onChange={(e) => setNewClientName(e.target.value)} />
           <TextField label="Telefone" fullWidth value={newClientPhone} onChange={(e) => setNewClientPhone(e.target.value)} />
-          <TextField label="Grupo" fullWidth value={newClientGroup} onChange={(e) => setNewClientGroup(e.target.value)} />
+          <Box>
+            <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, display: 'block' }}>Grupo — toque para escolher:</Typography>
+            <Box display="flex" flexWrap="wrap" gap={0.75} sx={{ maxHeight: 130, overflowY: 'auto', mb: 1 }}>
+              {customerGroups.map((g) => (
+                <Chip key={g} label={g} size="small" clickable
+                  color={newClientGroup === g ? 'primary' : 'default'}
+                  variant={newClientGroup === g ? 'filled' : 'outlined'}
+                  onClick={() => setNewClientGroup(g)} />
+              ))}
+            </Box>
+            <TextField label="Grupo (ou digite um novo)" fullWidth size="small" value={newClientGroup} onChange={(e) => setNewClientGroup(e.target.value)} helperText="Se o grupo não existir, digite o nome dele aqui — ele será criado com o cliente." />
+          </Box>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpenNewClientDialog(false)}>Cancelar</Button>
