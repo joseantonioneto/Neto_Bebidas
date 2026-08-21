@@ -261,6 +261,48 @@ function TurnstileWidget({ siteKey, resetKey, onVerify, onExpire, onError }) {
   );
 }
 
+// --- SELETOR DE GRUPO (lista + botão de cadastrar novo) ---
+function GroupPicker({ value, onChange, groups }) {
+  const [adding, setAdding] = useState(false);
+  const [novo, setNovo] = useState('');
+  const options = useMemo(() => {
+    const s = new Set(groups);
+    if (value) s.add(value);
+    return Array.from(s).sort((a, b) => a.localeCompare(b));
+  }, [groups, value]);
+
+  const confirmNew = () => {
+    if (!novo.trim()) return;
+    onChange(novo.trim());
+    setAdding(false);
+    setNovo('');
+  };
+
+  if (adding) {
+    return (
+      <Box display="flex" gap={1} alignItems="center">
+        <TextField autoFocus size="small" label="Nome do novo grupo" fullWidth value={novo}
+          onChange={(e) => setNovo(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && confirmNew()} />
+        <Button size="small" variant="contained" disabled={!novo.trim()} onClick={confirmNew}>OK</Button>
+        <IconButton size="small" onClick={() => { setAdding(false); setNovo(''); }}><Close fontSize="small" /></IconButton>
+      </Box>
+    );
+  }
+  return (
+    <Box display="flex" gap={1} alignItems="center">
+      <FormControl fullWidth size="small">
+        <InputLabel>Grupo</InputLabel>
+        <Select label="Grupo" value={options.includes(value) ? value : ''} onChange={(e) => onChange(e.target.value)}>
+          <MenuItem value=""><em>Sem grupo</em></MenuItem>
+          {options.map((g) => <MenuItem key={g} value={g}>{g}</MenuItem>)}
+        </Select>
+      </FormControl>
+      <Button size="small" variant="outlined" startIcon={<Add />} onClick={() => setAdding(true)} sx={{ flexShrink: 0 }}>Novo</Button>
+    </Box>
+  );
+}
+
 // --- SCANNER COMPONENT ---
 function BarcodeScanner({ open, onClose, onScan }) {
   const html5QrCodeRef = useRef(null);
@@ -2024,18 +2066,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         <DialogContent sx={{ pt: 2, display: 'flex', flexDirection: 'column', gap: 2 }}>
           <TextField autoFocus label="Nome" fullWidth value={newClientName} onChange={(e) => setNewClientName(e.target.value)} />
           <TextField label="Telefone" fullWidth value={newClientPhone} onChange={(e) => setNewClientPhone(e.target.value)} />
-          <Box>
-            <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, display: 'block' }}>Grupo — toque para escolher:</Typography>
-            <Box display="flex" flexWrap="wrap" gap={0.75} sx={{ maxHeight: 130, overflowY: 'auto', mb: 1 }}>
-              {customerGroups.map((g) => (
-                <Chip key={g} label={g} size="small" clickable
-                  color={newClientGroup === g ? 'primary' : 'default'}
-                  variant={newClientGroup === g ? 'filled' : 'outlined'}
-                  onClick={() => setNewClientGroup(g)} />
-              ))}
-            </Box>
-            <TextField label="Grupo (ou digite um novo)" fullWidth size="small" value={newClientGroup} onChange={(e) => setNewClientGroup(e.target.value)} helperText="Se o grupo não existir, digite o nome dele aqui — ele será criado com o cliente." />
-          </Box>
+          <GroupPicker value={newClientGroup} onChange={setNewClientGroup} groups={customerGroups} />
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpenNewClientDialog(false)}>Cancelar</Button>
@@ -2055,16 +2086,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           <TextField margin="dense" label="Nome" fullWidth value={customerDialog.name} onChange={(e) => setCustomerDialog(prev => ({ ...prev, name: e.target.value }))} />
           <TextField margin="dense" label="Telefone" fullWidth value={customerDialog.phone} onChange={(e) => setCustomerDialog(prev => ({ ...prev, phone: e.target.value }))} sx={{ mt: 1 }} />
           <Box sx={{ mt: 1.5 }}>
-            <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, display: 'block' }}>Grupo — toque para escolher:</Typography>
-            <Box display="flex" flexWrap="wrap" gap={0.75} sx={{ maxHeight: 110, overflowY: 'auto', mb: 1 }}>
-              {customerGroups.map((g) => (
-                <Chip key={g} label={g} size="small" clickable
-                  color={customerDialog.group_name === g ? 'primary' : 'default'}
-                  variant={customerDialog.group_name === g ? 'filled' : 'outlined'}
-                  onClick={() => setCustomerDialog(prev => ({ ...prev, group_name: g }))} />
-              ))}
-            </Box>
-            <TextField label="Grupo (ou digite um novo)" fullWidth size="small" value={customerDialog.group_name} onChange={(e) => setCustomerDialog(prev => ({ ...prev, group_name: e.target.value }))} />
+            <GroupPicker value={customerDialog.group_name} onChange={(g) => setCustomerDialog(prev => ({ ...prev, group_name: g }))} groups={customerGroups} />
           </Box>
 
           <Divider sx={{ my: 2 }} />
