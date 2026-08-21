@@ -379,6 +379,7 @@ function App() {
   const [newClientPhone, setNewClientPhone] = useState('');
   const [newClientGroup, setNewClientGroup] = useState('Caminhar Cristo Rei');
   const [clientSort, setClientSort] = useState('nome'); // 'nome' | 'grupo'
+  const [customerDialog, setCustomerDialog] = useState({ open: false, id: null, name: '', phone: '', group_name: '', debt: 0, sales: [], loadingSales: false });
 
   const [openProductDialog, setOpenProductDialog] = useState(false);
   const [openEditProductDialog, setOpenEditProductDialog] = useState(false);
@@ -946,6 +947,30 @@ function App() {
       fetchVouchers();
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro ao cancelar', 'error');
+    }
+  };
+
+  // Abre o modal do cliente (editar + histórico de compras)
+  const openCustomerDialog = async (row) => {
+    setCustomerDialog({ open: true, id: row.id, name: row.name, phone: row.phone || '', group_name: row.group_name || '', debt: row.debt, sales: [], loadingSales: true });
+    try {
+      const { data } = await api.get(`/customers/${row.id}/sales`);
+      setCustomerDialog(prev => (prev.id === row.id ? { ...prev, sales: data, loadingSales: false } : prev));
+    } catch {
+      setCustomerDialog(prev => (prev.id === row.id ? { ...prev, loadingSales: false } : prev));
+    }
+  };
+
+  const handleSaveCustomer = async () => {
+    const { id, name, phone, group_name } = customerDialog;
+    if (!name.trim()) return showFeedback('Nome obrigatório', 'warning');
+    try {
+      await api.put(`/customers/${id}`, { name: name.trim(), phone: phone.trim() || null, group_name: group_name.trim() || null });
+      showFeedback('Cliente atualizado!', 'success');
+      setCustomerDialog(prev => ({ ...prev, open: false }));
+      fetchData();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao salvar cliente', 'error');
     }
   };
 
@@ -1788,9 +1813,9 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 </TableHead>
                 <TableBody>
                   {filteredCustomers.map((row) => (
-                    <TableRow key={row.id}>
-                      <TableCell>
-                        {row.name}
+                    <TableRow key={row.id} hover>
+                      <TableCell onClick={() => openCustomerDialog(row)} sx={{ cursor: 'pointer' }}>
+                        <Typography variant="body2" color="primary" fontWeight="bold" component="span">{row.name}</Typography>
                         {isMobile && row.group_name && <Typography variant="caption" display="block" color="text.secondary">{row.group_name}</Typography>}
                       </TableCell>
                       {!isMobile && <TableCell>{row.group_name || '—'}</TableCell>}
@@ -2015,6 +2040,63 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         <DialogActions>
           <Button onClick={() => setOpenNewClientDialog(false)}>Cancelar</Button>
           <Button onClick={handleCreateCustomer} variant="contained">Salvar</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Editar Cliente + histórico de compras */}
+      <Dialog open={customerDialog.open} onClose={() => setCustomerDialog(prev => ({ ...prev, open: false }))} fullWidth maxWidth="sm">
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 }}>
+          Cliente
+          {customerDialog.debt > 0
+            ? <Chip label={`Deve R$ ${formatCurrency(customerDialog.debt)}`} color="error" size="small" />
+            : <Chip label="Sem dívida" color="success" size="small" variant="outlined" />}
+        </DialogTitle>
+        <DialogContent sx={{ pt: 2 }}>
+          <TextField margin="dense" label="Nome" fullWidth value={customerDialog.name} onChange={(e) => setCustomerDialog(prev => ({ ...prev, name: e.target.value }))} />
+          <TextField margin="dense" label="Telefone" fullWidth value={customerDialog.phone} onChange={(e) => setCustomerDialog(prev => ({ ...prev, phone: e.target.value }))} sx={{ mt: 1 }} />
+          <Box sx={{ mt: 1.5 }}>
+            <Typography variant="caption" color="text.secondary" sx={{ mb: 0.5, display: 'block' }}>Grupo — toque para escolher:</Typography>
+            <Box display="flex" flexWrap="wrap" gap={0.75} sx={{ maxHeight: 110, overflowY: 'auto', mb: 1 }}>
+              {customerGroups.map((g) => (
+                <Chip key={g} label={g} size="small" clickable
+                  color={customerDialog.group_name === g ? 'primary' : 'default'}
+                  variant={customerDialog.group_name === g ? 'filled' : 'outlined'}
+                  onClick={() => setCustomerDialog(prev => ({ ...prev, group_name: g }))} />
+              ))}
+            </Box>
+            <TextField label="Grupo (ou digite um novo)" fullWidth size="small" value={customerDialog.group_name} onChange={(e) => setCustomerDialog(prev => ({ ...prev, group_name: e.target.value }))} />
+          </Box>
+
+          <Divider sx={{ my: 2 }} />
+          <Typography variant="subtitle2" gutterBottom>Compras {customerDialog.loadingSales ? '(carregando...)' : `(${customerDialog.sales.length})`}</Typography>
+          {customerDialog.loadingSales && <LinearProgress />}
+          {!customerDialog.loadingSales && customerDialog.sales.length === 0 && (
+            <Typography variant="body2" color="text.secondary">Nenhuma compra registrada.</Typography>
+          )}
+          {!customerDialog.loadingSales && customerDialog.sales.length > 0 && (
+            <List dense sx={{ maxHeight: 240, overflowY: 'auto', bgcolor: '#fafafa', borderRadius: 1, p: 0 }}>
+              {customerDialog.sales.map((s) => (
+                <ListItem key={s.id} sx={{ display: 'block', borderBottom: '1px solid #eee', py: 1 }}>
+                  <Box display="flex" justifyContent="space-between" alignItems="center" gap={1}>
+                    <Typography variant="body2" fontWeight="bold">R$ {formatCurrency(s.total_value)}</Typography>
+                    <Chip size="small" label={s.payment_method_label || (s.is_paid ? 'Pago' : 'Fiado')} color={s.is_paid ? 'success' : 'warning'} variant="outlined" />
+                  </Box>
+                  <Typography variant="caption" color="text.secondary" display="block">
+                    {formatDateTimeBR(s.created_at)}{s.seller_username ? ` · ${s.seller_username}` : ''}
+                  </Typography>
+                  {(s.items || []).length > 0 && (
+                    <Typography variant="caption" display="block" sx={{ mt: 0.25 }}>
+                      {(s.items || []).map((it) => `${it.quantity}x ${it.product?.name || 'item'}`).join(' · ')}
+                    </Typography>
+                  )}
+                </ListItem>
+              ))}
+            </List>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCustomerDialog(prev => ({ ...prev, open: false }))}>Fechar</Button>
+          <Button onClick={handleSaveCustomer} variant="contained">Salvar alterações</Button>
         </DialogActions>
       </Dialog>
 

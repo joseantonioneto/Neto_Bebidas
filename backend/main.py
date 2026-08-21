@@ -1050,6 +1050,15 @@ async def import_customers_csv(file: UploadFile = File(...), db: Session = Depen
     return {"message": f"{created} clientes importados, {skipped} ignorados/duplicados", "created": created, "skipped": skipped}
 
 
+@app.get("/customers/{id}/sales")
+def list_customer_sales(id: int, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    sales = db.query(Sale).options(
+        joinedload(Sale.customer),
+        joinedload(Sale.items).joinedload(SaleItem.product)
+    ).filter(Sale.customer_id == id).order_by(Sale.created_at.desc()).all()
+    return [serialize_sale(sale) for sale in sales]
+
+
 # --- VENDAS ---
 
 @app.get("/sales/")

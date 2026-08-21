@@ -944,6 +944,20 @@ async function listSales(db) {
   return sales;
 }
 
+async function listCustomerSales(db, customerId) {
+  const rows = await all(db, `
+    SELECT s.*, c.name AS customer_name, c.phone AS customer_phone,
+           c.group_name AS customer_group_name, c.debt AS customer_debt
+    FROM sales s
+    LEFT JOIN customers c ON c.id = s.customer_id
+    WHERE s.customer_id = ?
+    ORDER BY datetime(s.created_at) DESC, s.id DESC
+  `, customerId);
+  const sales = [];
+  for (const row of rows) sales.push(serializeSale(row, await getSaleItems(db, row.id)));
+  return sales;
+}
+
 async function createSale(request, db, user) {
   const data = await readJson(request);
   const paymentMethod = normalizePaymentMethod(data.payment_method || 'dinheiro');
@@ -1253,6 +1267,10 @@ async function handle(request, env, params) {
     if (second && third === 'pay' && request.method === 'POST') {
       requireSellerOrAdmin(currentUser);
       return json(await payDebt(request, db, intValue(second)));
+    }
+    if (second && third === 'sales' && request.method === 'GET') {
+      requireSellerOrAdmin(currentUser);
+      return json(await listCustomerSales(db, intValue(second)));
     }
     if (second && request.method === 'PUT') {
       requireSellerOrAdmin(currentUser);
