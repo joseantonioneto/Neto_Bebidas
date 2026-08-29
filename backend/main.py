@@ -129,6 +129,19 @@ class SaleItem(Base):
     product = relationship("Product")
 
 
+class ActivityLog(Base):
+    __tablename__ = "activity_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(120), index=True)
+    role = Column(String(30), nullable=True)
+    action = Column(String(120))
+    detail = Column(Text, nullable=True)
+    method = Column(String(10))
+    path = Column(String(200))
+    status = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class Voucher(Base):
     __tablename__ = "vouchers"
     id = Column(Integer, primary_key=True, index=True)
@@ -1048,6 +1061,78 @@ async def import_customers_csv(file: UploadFile = File(...), db: Session = Depen
         created += 1
     db.commit()
     return {"message": f"{created} clientes importados, {skipped} ignorados/duplicados", "created": created, "skipped": skipped}
+
+
+ACTIVITY_ACTIONS = {
+    ("POST", "token"): "Login",
+    ("POST", "sales"): "Registrou venda",
+    ("POST", "products"): "Cadastrou/abasteceu produto",
+    ("PUT", "products"): "Editou produto",
+    ("DELETE", "products"): "Excluiu produto",
+    ("POST", "customers"): "Cadastrou cliente",
+    ("PUT", "customers"): "Editou cliente",
+    ("DELETE", "customers"): "Excluiu cliente",
+    ("POST", "vouchers"): "Pré-venda / voucher",
+    ("POST", "users"): "Criou usuário",
+    ("PUT", "users"): "Editou usuário",
+    ("DELETE", "users"): "Excluiu usuário",
+    ("POST", "category-costs"): "Lançou custo de setor",
+    ("DELETE", "category-costs"): "Excluiu custo de setor",
+}
+
+
+@app.middleware("http")
+async def activity_log_middleware(request: Request, call_next):
+    response = await call_next(request)
+    try:
+        parts = [p for p in request.url.path.split("/") if p]
+        if not parts:
+            return response
+        action = ACTIVITY_ACTIONS.get((request.method.upper(), parts[0]))
+        if not action:
+            return response
+        username = None
+        role = None
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            try:
+                payload = jwt.decode(auth[7:], SECRET_KEY, algorithms=[ALGORITHM])
+                username = payload.get("sub")
+                role = payload.get("role")
+            except JWTError:
+                pass
+        ok = 200 <= response.status_code < 300
+        db = SessionLocal()
+        try:
+            db.add(ActivityLog(
+                username=username,
+                role=role,
+                action=action if ok else f"{action} (falhou)",
+                detail=None if ok else f"status {response.status_code}",
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass  # auditoria nunca deve quebrar a requisição
+    return response
+
+
+@app.get("/activity-logs")
+def list_activity_logs(limit: int = 200, user: Optional[str] = None,
+                       db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    q = db.query(ActivityLog)
+    if user:
+        q = q.filter(ActivityLog.username == user)
+    rows = q.order_by(ActivityLog.id.desc()).limit(min(max(limit, 1), 500)).all()
+    return [{
+        "id": r.id, "username": r.username, "role": r.role, "action": r.action,
+        "detail": r.detail, "method": r.method, "path": r.path, "status": r.status,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
 
 
 @app.get("/customers/{id}/sales")

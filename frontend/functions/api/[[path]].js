@@ -437,15 +437,17 @@ async function verifyTurnstile(request, env, token) {
   }
 }
 
-async function login(request, env, db) {
+async function login(request, env, db, ctx = {}) {
   const form = await readFormFields(request);
   const username = String(form.username || '').trim();
   const password = String(form.password || '');
+  ctx.loginUsername = username;
   await verifyTurnstile(request, env, form.turnstileToken);
   const user = await first(db, 'SELECT * FROM users WHERE username = ?', username);
   if (!user || !bcrypt.compareSync(password, user.hashed_password || '')) {
     throw new HttpError(400, 'Login incorreto');
   }
+  ctx.user = user;
   return json({
     access_token: await createAccessToken(user, env),
     token_type: 'bearer',
@@ -1144,15 +1146,18 @@ async function salesSummary(request, db) {
 }
 
 
-async function handle(request, env, params) {
+async function handle(request, env, params, ctx = {}) {
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: json({}).headers });
 
   const db = getDb(env);
   if (!db) throw new HttpError(500, 'Binding D1 DB nao configurado');
+  ctx.db = db;
 
   const path = normalizePath(params.path);
   const parts = path ? path.split('/') : [];
   const [resource, second, third] = parts;
+  ctx.parts = parts;
+  ctx.path = path;
 
   if (!resource || (resource === 'health' && request.method === 'GET')) {
     return json({ status: 'ok', timestamp: new Date().toISOString(), runtime: 'cloudflare-d1' });
@@ -1167,9 +1172,10 @@ async function handle(request, env, params) {
     return json({ public_key: PAGBANK_PUBLIC_KEY, created_at: PAGBANK_KEY_CREATED_AT });
   }
 
-  if (resource === 'token' && request.method === 'POST') return login(request, env, db);
+  if (resource === 'token' && request.method === 'POST') return login(request, env, db, ctx);
 
   const currentUser = await getCurrentUser(request, env, db);
+  ctx.user = currentUser;
 
   if (resource === 'me' && request.method === 'GET') return json(serializeUser(currentUser));
 
@@ -1215,6 +1221,11 @@ async function handle(request, env, params) {
     if (!second && request.method === 'POST') return json(await createUser(request, db));
     if (second && request.method === 'PUT') return json(await updateUser(request, db, intValue(second)));
     if (second && request.method === 'DELETE') return json(await deleteUser(db, intValue(second), currentUser));
+  }
+
+  if (resource === 'activity-logs' && request.method === 'GET') {
+    requireAdmin(currentUser);
+    return json(await listActivityLogs(db, new URL(request.url)));
   }
 
   if (resource === 'products') {
@@ -1488,12 +1499,120 @@ async function voucherSummary(db) {
   };
 }
 
-export async function onRequest({ request, env, params }) {
+// ===== Registro de atividades (auditoria) =====
+// Descreve a acao a partir do metodo + rota. Retorna null para rotas que nao devem ser logadas.
+function describeAction(method, parts) {
+  const [r, s, t] = parts;
+  const M = method.toUpperCase();
+  if (r === 'token' && M === 'POST') return 'Login';
+  if (r === 'users' && s === 'me' && t === 'password') return 'Trocou a propria senha';
+  if (r === 'sales' && M === 'POST') return 'Registrou venda';
+  if (r === 'products' && M === 'POST' && !s) return 'Cadastrou/abasteceu produto';
+  if (r === 'products' && M === 'PUT') return 'Editou produto';
+  if (r === 'products' && M === 'DELETE') return 'Excluiu produto';
+  if (r === 'products' && s === 'generate-qrcode-all') return 'Gerou QR codes em massa';
+  if (r === 'products' && t === 'generate-qrcode') return 'Gerou QR code de produto';
+  if (r === 'products' && s === 'import-nfe') return 'Importou NF-e';
+  if (r === 'customers' && M === 'POST' && !s) return 'Cadastrou cliente';
+  if (r === 'customers' && t === 'pay') return 'Recebeu pagamento de fiado';
+  if (r === 'customers' && M === 'PUT') return 'Editou cliente';
+  if (r === 'customers' && M === 'DELETE') return 'Excluiu cliente';
+  if (r === 'customers' && (s === 'bulk' || s === 'import-csv')) return 'Importou clientes';
+  if (r === 'vouchers' && M === 'POST' && !s) return 'Criou pre-venda';
+  if (r === 'vouchers' && t === 'redeem') return 'Deu baixa em voucher';
+  if (r === 'vouchers' && t === 'cancel') return 'Cancelou voucher';
+  if (r === 'users' && M === 'POST') return 'Criou usuario';
+  if (r === 'users' && M === 'PUT') return 'Editou usuario';
+  if (r === 'users' && M === 'DELETE') return 'Excluiu usuario';
+  if (r === 'category-costs' && M === 'POST') return 'Lancou custo de setor';
+  if (r === 'category-costs' && M === 'DELETE') return 'Excluiu custo de setor';
+  if (r === 'pix' && s === 'charge' && M === 'POST') return 'Gerou cobranca PIX';
+  return null;
+}
+
+// Extrai um resumo curto e seguro da resposta (nunca inclui senha/foto)
+function summarizePayload(data) {
+  if (!data || typeof data !== 'object') return '';
+  const bits = [];
+  if (data.code) bits.push(String(data.code));
+  if (data.name) bits.push(String(data.name).slice(0, 60));
+  if (data.customer_name) bits.push(String(data.customer_name).slice(0, 60));
+  if (data.username) bits.push(String(data.username).slice(0, 40));
+  if (data.customer && data.customer.name) bits.push(String(data.customer.name).slice(0, 60));
+  if (data.quantity !== undefined && data.quantity !== null) bits.push(`${data.quantity}x`);
+  if (data.total_value !== undefined) bits.push(`R$ ${numberValue(data.total_value).toFixed(2)}`);
+  else if (data.amount !== undefined) bits.push(`R$ ${numberValue(data.amount).toFixed(2)}`);
+  if (data.payment_method_label) bits.push(String(data.payment_method_label));
+  if (data.stock !== undefined && data.stock !== null && data.name) bits.push(`estoque ${intValue(data.stock)}`);
+  if (data.message && bits.length === 0) bits.push(String(data.message).slice(0, 80));
+  return bits.join(' · ').slice(0, 200);
+}
+
+async function writeActivityLog(db, entry) {
   try {
-    return await handle(request, env, params);
+    await run(db, `
+      INSERT INTO activity_logs (username, role, action, detail, method, path, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `, entry.username || null, entry.role || null, entry.action, entry.detail || null,
+       entry.method, entry.path, entry.status);
+  } catch { /* auditoria nunca deve quebrar a operacao */ }
+}
+
+async function listActivityLogs(db, url) {
+  const limit = Math.min(500, Math.max(1, intValue(url.searchParams.get('limit')) || 200));
+  const user = (url.searchParams.get('user') || '').trim();
+  const rows = user
+    ? await all(db, 'SELECT * FROM activity_logs WHERE username = ? ORDER BY id DESC LIMIT ?', user, limit)
+    : await all(db, 'SELECT * FROM activity_logs ORDER BY id DESC LIMIT ?', limit);
+  return rows.map((r) => ({
+    id: r.id, username: r.username, role: r.role, action: r.action,
+    detail: r.detail, method: r.method, path: r.path, status: r.status,
+    created_at: r.created_at
+  }));
+}
+
+export async function onRequest({ request, env, params }) {
+  const ctx = {};
+  let response;
+  try {
+    response = await handle(request, env, params, ctx);
   } catch (error) {
-    if (error instanceof HttpError) return json({ detail: error.detail }, error.status);
-    console.error(error);
-    return json({ detail: 'Erro interno' }, 500);
+    if (error instanceof HttpError) response = json({ detail: error.detail }, error.status);
+    else {
+      console.error(error);
+      response = json({ detail: 'Erro interno' }, 500);
+    }
   }
+
+  // Auditoria: registra apenas acoes que alteram dados (e o login), nunca leituras.
+  try {
+    const action = describeAction(request.method, ctx.parts || []);
+    if (action && ctx.db) {
+      const ok = response.status >= 200 && response.status < 300;
+      let detail = '';
+      if (ok) {
+        try {
+          const body = await response.clone().json();
+          detail = summarizePayload(Array.isArray(body) ? body[0] : body);
+        } catch { /* resposta sem JSON */ }
+      } else {
+        try {
+          const body = await response.clone().json();
+          detail = `FALHOU: ${String(body.detail || '').slice(0, 120)}`;
+        } catch { detail = 'FALHOU'; }
+      }
+      const username = ctx.user?.username || ctx.loginUsername || null;
+      await writeActivityLog(ctx.db, {
+        username,
+        role: ctx.user?.role || null,
+        action: ok ? action : `${action} (falhou)`,
+        detail,
+        method: request.method,
+        path: '/' + (ctx.path || ''),
+        status: response.status
+      });
+    }
+  } catch { /* auditoria nunca deve quebrar a resposta */ }
+
+  return response;
 }

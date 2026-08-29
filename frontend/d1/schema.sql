@@ -77,7 +77,21 @@ CREATE TABLE IF NOT EXISTS vouchers (
   redeemed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS activity_logs (
+  id INTEGER PRIMARY KEY,
+  username TEXT,
+  role TEXT,
+  action TEXT,
+  detail TEXT,
+  method TEXT,
+  path TEXT,
+  status INTEGER,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS ix_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS ix_activity_logs_created_at ON activity_logs(created_at);
+CREATE INDEX IF NOT EXISTS ix_activity_logs_username ON activity_logs(username);
 CREATE INDEX IF NOT EXISTS ix_vouchers_code ON vouchers(code);
 CREATE INDEX IF NOT EXISTS ix_vouchers_status ON vouchers(status);
 CREATE INDEX IF NOT EXISTS ix_products_name ON products(name);

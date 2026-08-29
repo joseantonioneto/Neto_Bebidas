@@ -422,6 +422,9 @@ function App() {
   const [newClientGroup, setNewClientGroup] = useState('Caminhar Cristo Rei');
   const [clientSort, setClientSort] = useState('nome'); // 'nome' | 'grupo'
   const [customerDialog, setCustomerDialog] = useState({ open: false, id: null, name: '', phone: '', group_name: '', debt: 0, sales: [], loadingSales: false });
+  const [activityLogs, setActivityLogs] = useState([]);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logUserFilter, setLogUserFilter] = useState('');
 
   const [openProductDialog, setOpenProductDialog] = useState(false);
   const [openEditProductDialog, setOpenEditProductDialog] = useState(false);
@@ -572,6 +575,15 @@ function App() {
     return () => window.clearInterval(intervalId);
   }, [token, tabValue, fetchData]);
 
+  const fetchActivityLogs = useCallback(async () => {
+    setLogsLoading(true);
+    try {
+      const { data } = await api.get('/activity-logs', { params: { limit: 300 } });
+      setActivityLogs(data);
+    } catch { /* silencioso */ }
+    setLogsLoading(false);
+  }, []);
+
   const fetchVouchers = useCallback(async () => {
     try {
       const [listRes, sumRes] = await Promise.all([api.get('/vouchers'), api.get('/vouchers/summary')]);
@@ -586,6 +598,13 @@ function App() {
     fetchVouchers();
     return undefined;
   }, [token, tabValue, fetchVouchers]);
+
+  // Carrega o registro de atividades ao abrir a aba (somente admin)
+  useEffect(() => {
+    if (!token || tabValue !== 'atividade') return undefined;
+    fetchActivityLogs();
+    return undefined;
+  }, [token, tabValue, fetchActivityLogs]);
 
   // PIX automático: consulta o PagBank a cada 4s e faz a contagem regressiva do QR
   useEffect(() => {
@@ -1014,6 +1033,25 @@ function App() {
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro ao salvar cliente', 'error');
     }
+  };
+
+  const handleExportLogs = () => {
+    if (!activityLogs.length) return showFeedback('Nenhuma atividade para exportar', 'info');
+    const header = ['Quando', 'Usuário', 'Perfil', 'Ação', 'Detalhe', 'Status'];
+    const rows = activityLogs.map((l) => [
+      formatDateTimeBR(l.created_at), l.username || '', ROLE_LABELS[l.role] || l.role || '',
+      l.action, l.detail || '', l.status
+    ]);
+    const csv = '﻿' + [header, ...rows]
+      .map((row) => row.map((cell) => `"${String(cell ?? '').replaceAll('"', '""')}"`).join(';'))
+      .join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'atividade-usuarios.csv';
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleExportVouchers = () => {
@@ -1504,6 +1542,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <Tab value="clientes" label="Clientes" icon={<People />} />
             <Tab value="estoque" label="Estoque" icon={<Inventory />} />
             {isAdmin && <Tab value="usuarios" label="Usuários" icon={<AdminPanelSettings />} />}
+            {isAdmin && <Tab value="atividade" label="Atividade" icon={<Storage />} />}
           </Tabs>
         )}
       </AppBar>
@@ -1637,6 +1676,75 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Paper>
             </Grid>
           </Grid>
+        )}
+
+        {/* === ABA ATIVIDADE (auditoria — somente admin) === */}
+        {tabValue === 'atividade' && isAdmin && (
+          <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
+            <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
+              <Typography variant="h5">Atividade dos Usuários</Typography>
+              <Box display="flex" gap={1} flexWrap="wrap">
+                <Button variant="outlined" size={isMobile ? 'small' : 'medium'} startIcon={<Download />} onClick={handleExportLogs}>Exportar</Button>
+                <Button variant="contained" size={isMobile ? 'small' : 'medium'} startIcon={<Storage />} onClick={fetchActivityLogs}>Atualizar</Button>
+              </Box>
+            </Box>
+
+            {(() => {
+              const usuarios = Array.from(new Set(activityLogs.map(l => l.username).filter(Boolean))).sort();
+              const lista = logUserFilter ? activityLogs.filter(l => l.username === logUserFilter) : activityLogs;
+              return (
+                <>
+                  <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap" mb={2}>
+                    <Typography variant="caption" color="text.secondary">Usuário:</Typography>
+                    <Chip label="Todos" size="small" clickable color={!logUserFilter ? 'primary' : 'default'} onClick={() => setLogUserFilter('')} />
+                    {usuarios.map(u => (
+                      <Chip key={u} label={u} size="small" clickable color={logUserFilter === u ? 'primary' : 'default'} onClick={() => setLogUserFilter(u)} />
+                    ))}
+                  </Box>
+
+                  {logsLoading && <LinearProgress sx={{ mb: 1 }} />}
+                  <Typography variant="caption" color="text.secondary">{lista.length} registros (mais recentes primeiro)</Typography>
+
+                  <TableContainer component={Paper} sx={{ mt: 0.5, maxHeight: '65vh' }}>
+                    <Table size="small" stickyHeader>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>Quando</TableCell>
+                          <TableCell>Usuário</TableCell>
+                          <TableCell>Ação</TableCell>
+                          {!isMobile && <TableCell>Detalhe</TableCell>}
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {lista.map((l) => {
+                          const falhou = l.status >= 400;
+                          return (
+                            <TableRow key={l.id} sx={falhou ? { bgcolor: '#ffebee' } : undefined}>
+                              <TableCell sx={{ whiteSpace: 'nowrap' }}>
+                                <Typography variant="caption">{formatDateTimeBR(l.created_at)}</Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" fontWeight="bold">{l.username || '—'}</Typography>
+                                {l.role && <Typography variant="caption" color="text.secondary">{ROLE_LABELS[l.role] || l.role}</Typography>}
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" color={falhou ? 'error' : 'inherit'}>{l.action}</Typography>
+                                {isMobile && l.detail && <Typography variant="caption" color="text.secondary" display="block">{l.detail}</Typography>}
+                              </TableCell>
+                              {!isMobile && <TableCell><Typography variant="caption" color="text.secondary">{l.detail || '—'}</Typography></TableCell>}
+                            </TableRow>
+                          );
+                        })}
+                        {!lista.length && !logsLoading && (
+                          <TableRow><TableCell colSpan={isMobile ? 3 : 4} align="center" sx={{ py: 4 }}>Nenhuma atividade registrada ainda.</TableCell></TableRow>
+                        )}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                </>
+              );
+            })()}
+          </Container>
         )}
 
         {/* === ABA PRÉ-VENDA (vouchers de combo com QR) === */}
@@ -2036,6 +2144,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <BottomNavigationAction label="Clientes" value="clientes" icon={<People />} />
             <BottomNavigationAction label="Estoque" value="estoque" icon={<Inventory />} />
             {isAdmin && <BottomNavigationAction label="Usuários" value="usuarios" icon={<AdminPanelSettings />} />}
+            {isAdmin && <BottomNavigationAction label="Atividade" value="atividade" icon={<Storage />} />}
           </BottomNavigation>
 
           {tabValue === 'vender' && (
