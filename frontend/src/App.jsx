@@ -1552,14 +1552,14 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         {/* === ABA RESUMO === */}
         {isAdmin && tabValue === 'resumo' && (
           <Grid container spacing={isMobile ? 2 : 3}>
-            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #2196f3' }}><Typography variant="caption" color="text.secondary">Total Vendido</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(totalSold)}</Typography></Paper></Grid>
-            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #4caf50' }}><Typography variant="caption" color="text.secondary">Recebido</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold" color="success.main">R$ {formatCurrency(totalCash)}</Typography></Paper></Grid>
-            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #ff9800' }}><Typography variant="caption" color="text.secondary">Fiado</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(reportDebt)}</Typography></Paper></Grid>
-            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #9c27b0' }}><Typography variant="caption" color="text.secondary">Lucro Estimado</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold" color="secondary">R$ {formatCurrency(reportProfit)}</Typography></Paper></Grid>
-            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #607d8b' }}><Typography variant="caption" color="text.secondary">Custo Produtos</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(directCostTotal)}</Typography></Paper></Grid>
-            <Grid item xs={6} md={3}><Paper sx={{ p: 2, borderLeft: '5px solid #795548' }}><Typography variant="caption" color="text.secondary">Custo Setores</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(indirectCostTotal)}</Typography></Paper></Grid>
+            <Grid size={{ xs: 6, md: 3 }}><Paper sx={{ p: 2, borderLeft: '5px solid #2196f3' }}><Typography variant="caption" color="text.secondary">Total Vendido</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(totalSold)}</Typography></Paper></Grid>
+            <Grid size={{ xs: 6, md: 3 }}><Paper sx={{ p: 2, borderLeft: '5px solid #4caf50' }}><Typography variant="caption" color="text.secondary">Recebido</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold" color="success.main">R$ {formatCurrency(totalCash)}</Typography></Paper></Grid>
+            <Grid size={{ xs: 6, md: 3 }}><Paper sx={{ p: 2, borderLeft: '5px solid #ff9800' }}><Typography variant="caption" color="text.secondary">Fiado</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(reportDebt)}</Typography></Paper></Grid>
+            <Grid size={{ xs: 6, md: 3 }}><Paper sx={{ p: 2, borderLeft: '5px solid #9c27b0' }}><Typography variant="caption" color="text.secondary">Lucro Estimado</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold" color="secondary">R$ {formatCurrency(reportProfit)}</Typography></Paper></Grid>
+            <Grid size={{ xs: 6, md: 3 }}><Paper sx={{ p: 2, borderLeft: '5px solid #607d8b' }}><Typography variant="caption" color="text.secondary">Custo Produtos</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(directCostTotal)}</Typography></Paper></Grid>
+            <Grid size={{ xs: 6, md: 3 }}><Paper sx={{ p: 2, borderLeft: '5px solid #795548' }}><Typography variant="caption" color="text.secondary">Custo Setores</Typography><Typography variant={isMobile ? "h6" : "h5"} fontWeight="bold">R$ {formatCurrency(indirectCostTotal)}</Typography></Paper></Grid>
 
-            <Grid item xs={12}>
+            <Grid size={12}>
               <Paper sx={{ p: isMobile ? 2 : 3, height: isMobile ? 300 : 400, display: 'flex', flexDirection: 'column' }}>
                 <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} flexWrap="wrap" gap={1}>
                   <Typography variant="h6">Vendas por Período</Typography>
@@ -1587,7 +1587,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Paper>
             </Grid>
 
-            <Grid item xs={12} md={5}>
+            <Grid size={{ xs: 12, md: 5 }}>
               <Paper sx={{ p: 2, height: '100%' }}>
                 <Box display="flex" justifyContent="space-between" alignItems="center" mb={1}>
                   <Typography variant="h6">Fechamento por Pagamento</Typography>
@@ -1605,7 +1605,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Paper>
             </Grid>
 
-            <Grid item xs={12} md={7}>
+            <Grid size={{ xs: 12, md: 7 }}>
               <Paper sx={{ p: 2, height: '100%' }}>
                 <Typography variant="h6" gutterBottom>Produtos Vendidos</Typography>
                 <TableContainer sx={{ maxHeight: 260 }}>
@@ -1623,7 +1623,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             </Grid>
 
             {reportSummary?.by_seller?.length > 0 && (
-              <Grid item xs={12} md={5}>
+              <Grid size={{ xs: 12, md: 5 }}>
                 <Paper sx={{ p: 2 }}>
                   <Typography variant="h6" gutterBottom>Vendas por Vendedor</Typography>
                   <Table size="small">
@@ -1639,7 +1639,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             )}
 
             {reportSummary?.by_category_cost?.length > 0 && (
-              <Grid item xs={12} md={5}>
+              <Grid size={{ xs: 12, md: 5 }}>
                 <Paper sx={{ p: 2 }}>
                   <Typography variant="h6" gutterBottom>Custos por Setor</Typography>
                   <Table size="small">
@@ -1654,7 +1654,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Grid>
             )}
 
-            <Grid item xs={12}>
+            <Grid size={12}>
               <Paper sx={{ p: 2 }}>
                 <Typography variant="h6" gutterBottom>Histórico de Vendas</Typography>
                 <TableContainer sx={{ maxHeight: 300 }}>
@@ -1767,10 +1767,10 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
 
             {voucherSummaryData && (
               <Grid container spacing={1} sx={{ mb: 2 }}>
-                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#1a237e">{voucherSummaryData.combos_vendidos}</Typography><Typography variant="caption" color="text.secondary">combos vendidos</Typography></Paper></Grid>
-                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#ef6c00">{voucherSummaryData.combos_pendentes}</Typography><Typography variant="caption" color="text.secondary">a retirar</Typography></Paper></Grid>
-                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#2e7d32">{voucherSummaryData.combos_retirados}</Typography><Typography variant="caption" color="text.secondary">retirados</Typography></Paper></Grid>
-                <Grid item xs={6} sm={3}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h6" fontWeight="900" color="#2e7d32">R$ {formatCurrency(voucherSummaryData.valor_arrecadado)}</Typography><Typography variant="caption" color="text.secondary">arrecadado</Typography></Paper></Grid>
+                <Grid size={{ xs: 6, sm: 3 }}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#1a237e">{voucherSummaryData.combos_vendidos}</Typography><Typography variant="caption" color="text.secondary">combos vendidos</Typography></Paper></Grid>
+                <Grid size={{ xs: 6, sm: 3 }}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#ef6c00">{voucherSummaryData.combos_pendentes}</Typography><Typography variant="caption" color="text.secondary">a retirar</Typography></Paper></Grid>
+                <Grid size={{ xs: 6, sm: 3 }}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h5" fontWeight="900" color="#2e7d32">{voucherSummaryData.combos_retirados}</Typography><Typography variant="caption" color="text.secondary">retirados</Typography></Paper></Grid>
+                <Grid size={{ xs: 6, sm: 3 }}><Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}><Typography variant="h6" fontWeight="900" color="#2e7d32">R$ {formatCurrency(voucherSummaryData.valor_arrecadado)}</Typography><Typography variant="caption" color="text.secondary">arrecadado</Typography></Paper></Grid>
               </Grid>
             )}
 
@@ -1858,7 +1858,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                       const low = !out && p.stock < 5;
                       const color = out ? '#c62828' : low ? '#ef6c00' : '#2e7d32';
                       return (
-                        <Grid item xs={12} sm={6} md={4} key={p.id}>
+                        <Grid size={{ xs: 12, sm: 6, md: 4 }} key={p.id}>
                           <Paper variant="outlined" sx={{ p: 1.25, display: 'flex', alignItems: 'center', gap: 1.5, borderLeft: `5px solid ${color}` }}>
                             {p.photo
                               ? <Box component="img" src={p.photo} alt={p.name} sx={{ width: 48, height: 48, borderRadius: 1, objectFit: 'cover', flexShrink: 0 }} />
@@ -1875,7 +1875,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                         </Grid>
                       );
                     })}
-                    {!list.length && <Grid item xs={12}><Typography align="center" color="text.secondary" sx={{ py: 4 }}>Nenhum produto encontrado.</Typography></Grid>}
+                    {!list.length && <Grid size={12}><Typography align="center" color="text.secondary" sx={{ py: 4 }}>Nenhum produto encontrado.</Typography></Grid>}
                   </Grid>
                 </>
               );
@@ -1886,7 +1886,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         {/* === ABA VENDAS === */}
         {tabValue === 'vender' && (
           <Grid container spacing={isMobile ? 2 : 3}>
-            <Grid item xs={12} md={8}>
+            <Grid size={{ xs: 12, md: 8 }}>
               <Paper sx={{ p: 2, mb: 2 }}>
                 <Box display="flex" gap={1} alignItems="center">
                   <TextField fullWidth variant="standard" placeholder="Buscar produto ou bipar código..." value={searchTermProduct} onChange={(e) => setSearchTermProduct(e.target.value)} onKeyDown={handleSearchEnter} InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }} />
@@ -1897,7 +1897,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Paper>
               <Grid container spacing={isMobile ? 1 : 2}>
                 {filteredProducts.map((p) => (
-                  <Grid item xs={6} sm={4} md={3} key={p.id}>
+                  <Grid size={{ xs: 6, sm: 4, md: 3 }} key={p.id}>
                     <Card sx={{ height: '100%', display: 'flex', flexDirection: 'column', opacity: p.stock > 0 ? 1 : 0.5 }}>
                       {p.photo && <Box component="img" src={p.photo} alt={p.name} sx={{ width: '100%', height: isMobile ? 90 : 120, objectFit: 'cover' }} />}
                       <CardContent sx={{ flexGrow: 1, p: isMobile ? 1 : 1.5 }}>
@@ -1918,8 +1918,8 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
 
             {/* Desktop: carrinho fixo na lateral */}
             {!isMobile && (
-              <Grid item xs={12} md={4}>
-                <Paper sx={{ p: 2, position: 'sticky', top: 20 }}>
+              <Grid size={{ xs: 12, md: 4 }}>
+                <Paper sx={{ p: 2, position: 'sticky', top: 16, maxHeight: 'calc(100vh - 32px)', overflowY: 'auto' }}>
                   {renderCartContent()}
                 </Paper>
               </Grid>
