@@ -399,6 +399,7 @@ function App() {
   const [pixDialog, setPixDialog] = useState({ open: false, status: 'loading', valor: 0, orderId: '', qrText: '', qrImage: '', expiresAt: 0 });
   const [pixNow, setPixNow] = useState(0);
   const [stockQuery, setStockQuery] = useState('');
+  const [stockCategoryFilter, setStockCategoryFilter] = useState('');
 
   // Pré-venda (vouchers)
   const [vouchers, setVouchers] = useState([]);
@@ -1843,12 +1844,21 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             />
             {(() => {
               const term = stockQuery.trim().toLowerCase();
+              const categorias = Array.from(new Set(products.map((p) => p.category || 'Geral'))).sort((a, b) => a.localeCompare(b));
               const list = [...products]
+                .filter((p) => !stockCategoryFilter || (p.category || 'Geral') === stockCategoryFilter)
                 .filter((p) => !term || p.name.toLowerCase().includes(term) || (p.category || '').toLowerCase().includes(term) || (p.barcode || '').includes(term))
                 .sort((a, b) => a.name.localeCompare(b.name));
               const totalUnidades = list.reduce((s, p) => s + (p.stock || 0), 0);
               return (
                 <>
+                  <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap" mb={1.5}>
+                    <Typography variant="caption" color="text.secondary">Categoria:</Typography>
+                    <Chip label="Todas" size="small" clickable color={!stockCategoryFilter ? 'primary' : 'default'} onClick={() => setStockCategoryFilter('')} />
+                    {categorias.map((c) => (
+                      <Chip key={c} label={c} size="small" clickable color={stockCategoryFilter === c ? 'primary' : 'default'} onClick={() => setStockCategoryFilter(c)} />
+                    ))}
+                  </Box>
                   <Typography variant="caption" color="text.secondary">
                     {list.length} {list.length === 1 ? 'produto' : 'produtos'} · {totalUnidades} unidades no total
                   </Typography>
