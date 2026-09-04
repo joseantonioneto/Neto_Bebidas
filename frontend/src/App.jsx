@@ -400,6 +400,8 @@ function App() {
   const [pixNow, setPixNow] = useState(0);
   const [stockQuery, setStockQuery] = useState('');
   const [stockCategoryFilter, setStockCategoryFilter] = useState('');
+  const [estoqueQuery, setEstoqueQuery] = useState('');
+  const [estoqueCategoryFilter, setEstoqueCategoryFilter] = useState('');
 
   // Pré-venda (vouchers)
   const [vouchers, setVouchers] = useState([]);
@@ -2059,6 +2061,34 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 </TableContainer>
               </Paper>
             )}
+            <Paper sx={{ p: 2, mb: 2 }}>
+              <TextField
+                fullWidth
+                variant="standard"
+                placeholder="Buscar produto, categoria ou código..."
+                value={estoqueQuery}
+                onChange={(e) => setEstoqueQuery(e.target.value)}
+                InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }}
+              />
+              {(() => {
+                const categorias = Array.from(new Set(products.map((p) => p.category || 'Geral'))).sort((a, b) => a.localeCompare(b));
+                return (
+                  <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap" sx={{ mt: 1.5 }}>
+                    <Typography variant="caption" color="text.secondary">Categoria:</Typography>
+                    <Chip label="Todas" size="small" clickable color={!estoqueCategoryFilter ? 'primary' : 'default'} onClick={() => setEstoqueCategoryFilter('')} />
+                    {categorias.map((c) => (
+                      <Chip key={c} label={c} size="small" clickable color={estoqueCategoryFilter === c ? 'primary' : 'default'} onClick={() => setEstoqueCategoryFilter(c)} />
+                    ))}
+                  </Box>
+                );
+              })()}
+            </Paper>
+            {(() => {
+              const term = estoqueQuery.trim().toLowerCase();
+              const filteredEstoque = products
+                .filter((p) => !estoqueCategoryFilter || (p.category || 'Geral') === estoqueCategoryFilter)
+                .filter((p) => !term || p.name.toLowerCase().includes(term) || (p.category || '').toLowerCase().includes(term) || (p.barcode || '').toLowerCase().includes(term));
+              return (
             <TableContainer component={Paper}>
               <Table size="small">
                 <TableHead sx={{ bgcolor: '#eee' }}>
@@ -2073,7 +2103,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {products.map((p) => (
+                  {filteredEstoque.map((p) => (
                     <TableRow key={p.id}>
                       <TableCell>
                         {p.name}
@@ -2092,9 +2122,14 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                       )}
                     </TableRow>
                   ))}
+                  {!filteredEstoque.length && (
+                    <TableRow><TableCell colSpan={isMobile ? (isAdmin ? 4 : 3) : (isAdmin ? 7 : 6)} align="center" sx={{ py: 3 }}>Nenhum produto encontrado.</TableCell></TableRow>
+                  )}
                 </TableBody>
               </Table>
             </TableContainer>
+              );
+            })()}
           </Container>
         )}
 
