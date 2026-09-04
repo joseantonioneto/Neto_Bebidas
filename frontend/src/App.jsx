@@ -1088,6 +1088,19 @@ function App() {
     } catch { showFeedback('Erro ao pagar.', 'error'); }
   };
 
+  const handleCancelSale = async (sale) => {
+    const itens = (sale.items || []).map((it) => `${it.quantity}x ${it.product?.name || 'item'}`).join(', ');
+    const confirmMsg = `Cancelar esta venda de R$ ${formatCurrency(sale.total_value)} (${sale.customer?.name || 'Consumidor Final'})?\n\nItens: ${itens || '—'}\n\nO estoque será devolvido${!sale.is_paid ? ' e a dívida do cliente será reduzida' : ''}. Esta ação não pode ser desfeita.`;
+    if (!window.confirm(confirmMsg)) return;
+    try {
+      await api.post(`/sales/${sale.id}/cancel`);
+      showFeedback('Venda cancelada e estoque restaurado!', 'success');
+      fetchData();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao cancelar venda', 'error');
+    }
+  };
+
   const handleCreateCustomer = async () => {
     if (!newClientName) return;
     await api.post('/customers/', { name: newClientName, phone: newClientPhone || null, group_name: newClientGroup || null });
@@ -1662,7 +1675,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 <Typography variant="h6" gutterBottom>Histórico de Vendas</Typography>
                 <TableContainer sx={{ maxHeight: 300 }}>
                   <Table stickyHeader size="small">
-                    <TableHead><TableRow><TableCell>Data</TableCell><TableCell>Cliente</TableCell><TableCell>Vendedor</TableCell><TableCell>Valor</TableCell><TableCell>Status</TableCell></TableRow></TableHead>
+                    <TableHead><TableRow><TableCell>Data</TableCell><TableCell>Cliente</TableCell><TableCell>Vendedor</TableCell><TableCell>Valor</TableCell><TableCell>Status</TableCell><TableCell align="center">Ação</TableCell></TableRow></TableHead>
                     <TableBody>
                       {salesHistory.map((sale) => (
                         <TableRow key={sale.id}>
@@ -1671,6 +1684,9 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                           <TableCell>{sale.seller_username || '---'}</TableCell>
                           <TableCell>R$ {formatCurrency(sale.total_value)}</TableCell>
                           <TableCell><Chip label={sale.payment_method_label || (sale.is_paid ? "PAGO" : "FIADO")} color={sale.is_paid ? "success" : "warning"} size="small" variant="outlined" /></TableCell>
+                          <TableCell align="center">
+                            <IconButton size="small" color="error" title="Cancelar venda (devolve o estoque)" onClick={() => handleCancelSale(sale)}><Delete fontSize="small" /></IconButton>
+                          </TableCell>
                         </TableRow>
                       ))}
                     </TableBody>

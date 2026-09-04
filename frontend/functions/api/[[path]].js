@@ -960,6 +960,22 @@ async function listCustomerSales(db, customerId) {
   return sales;
 }
 
+// Cancela uma venda: devolve o estoque de cada item, reverte a divida (se era fiado) e apaga o registro.
+async function cancelSale(db, id) {
+  const sale = await first(db, 'SELECT * FROM sales WHERE id = ?', id);
+  if (!sale) throw new HttpError(404, 'Venda nao encontrada');
+  const items = await all(db, 'SELECT * FROM sale_items WHERE sale_id = ?', id);
+  for (const item of items) {
+    await run(db, 'UPDATE products SET stock = stock + ? WHERE id = ?', intValue(item.quantity), item.product_id);
+  }
+  if (!sale.is_paid && sale.customer_id) {
+    await run(db, 'UPDATE customers SET debt = MAX(0, debt - ?) WHERE id = ?', numberValue(sale.total_value), sale.customer_id);
+  }
+  await run(db, 'DELETE FROM sale_items WHERE sale_id = ?', id);
+  await run(db, 'DELETE FROM sales WHERE id = ?', id);
+  return { message: 'Venda cancelada e estoque restaurado', restored_items: items.length };
+}
+
 async function createSale(request, db, user) {
   const data = await readJson(request);
   const paymentMethod = normalizePaymentMethod(data.payment_method || 'dinheiro');
@@ -1302,6 +1318,10 @@ async function handle(request, env, params, ctx = {}) {
       requireSellerOrAdmin(currentUser);
       return json(await createSale(request, db, currentUser));
     }
+    if (second && third === 'cancel' && request.method === 'POST') {
+      requireAdmin(currentUser);
+      return json(await cancelSale(db, intValue(second)));
+    }
   }
 
   if (resource === 'reports' && second === 'summary' && request.method === 'GET') {
@@ -1506,6 +1526,7 @@ function describeAction(method, parts) {
   const M = method.toUpperCase();
   if (r === 'token' && M === 'POST') return 'Login';
   if (r === 'users' && s === 'me' && t === 'password') return 'Trocou a propria senha';
+  if (r === 'sales' && t === 'cancel' && M === 'POST') return 'Cancelou venda';
   if (r === 'sales' && M === 'POST') return 'Registrou venda';
   if (r === 'products' && M === 'POST' && !s) return 'Cadastrou/abasteceu produto';
   if (r === 'products' && M === 'PUT') return 'Editou produto';

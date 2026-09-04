@@ -1088,7 +1088,10 @@ async def activity_log_middleware(request: Request, call_next):
         parts = [p for p in request.url.path.split("/") if p]
         if not parts:
             return response
-        action = ACTIVITY_ACTIONS.get((request.method.upper(), parts[0]))
+        if len(parts) >= 3 and parts[0] == "sales" and parts[2] == "cancel" and request.method.upper() == "POST":
+            action = "Cancelou venda"
+        else:
+            action = ACTIVITY_ACTIONS.get((request.method.upper(), parts[0]))
         if not action:
             return response
         username = None
@@ -1153,6 +1156,26 @@ def list_sales(db: Session = Depends(get_db), u: User = Depends(require_admin)):
         joinedload(Sale.items).joinedload(SaleItem.product)
     ).order_by(Sale.created_at.desc()).all()
     return [serialize_sale(sale) for sale in sales]
+
+@app.post("/sales/{id}/cancel")
+def cancel_sale(id: int, db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    sale = db.query(Sale).options(joinedload(Sale.items)).filter(Sale.id == id).first()
+    if not sale:
+        raise HTTPException(status_code=404, detail="Venda não encontrada")
+    for item in sale.items:
+        prod = db.query(Product).filter(Product.id == item.product_id).first()
+        if prod:
+            prod.stock = (prod.stock or 0) + item.quantity
+    if not sale.is_paid and sale.customer_id:
+        cust = db.query(Customer).filter(Customer.id == sale.customer_id).first()
+        if cust:
+            cust.debt = max(0, (cust.debt or 0) - sale.total_value)
+    restored = len(sale.items)
+    db.query(SaleItem).filter(SaleItem.sale_id == id).delete()
+    db.delete(sale)
+    db.commit()
+    return {"message": "Venda cancelada e estoque restaurado", "restored_items": restored}
+
 
 @app.post("/sales/")
 def create_sale(sale: SaleCreate, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
