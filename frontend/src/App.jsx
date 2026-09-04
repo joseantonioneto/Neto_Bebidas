@@ -1495,7 +1495,14 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
   // --- CARRINHO MOBILE (DRAWER) ---
   const renderCartContent = () => (
     <Box sx={{ p: 2, width: isMobile ? '100vw' : 'auto', maxWidth: 400 }}>
-      <Typography variant="h6" gutterBottom><ShoppingCart /> Carrinho ({cart.length})</Typography>
+      <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
+        <Typography variant="h6"><ShoppingCart /> Carrinho ({cart.length})</Typography>
+        {isMobile && (
+          <IconButton color="primary" onClick={handleScanForProduct} sx={{ bgcolor: '#e8eaf6' }} title="Bipar mais um produto">
+            <QrCodeScanner />
+          </IconButton>
+        )}
+      </Box>
       <Autocomplete options={customers} getOptionLabel={(o) => o.name} value={customers.find(c => c.id === selectedCustomer) || null} isOptionEqualToValue={(o, v) => o.id === v.id} onChange={(e, v) => setSelectedCustomer(v ? v.id : '')} renderInput={(params) => <TextField {...params} label="Cliente" size="small" />} sx={{ mb: 2 }} />
       <FormControl size="small" fullWidth sx={{ mb: 2 }}>
         <InputLabel>Pagamento</InputLabel>
@@ -2208,7 +2215,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             {isAdmin && <BottomNavigationAction label="Atividade" value="atividade" icon={<Storage />} />}
           </BottomNavigation>
 
-          {tabValue === 'vender' && (
+          {tabValue === 'vender' && !cartOpen && (
             <>
               <Fab color="primary" sx={{ position: 'fixed', bottom: 70, right: 16, zIndex: 1300 }} onClick={() => setCartOpen(true)}>
                 <Badge badgeContent={cart.length} color="error"><ShoppingCart /></Badge>
