@@ -165,6 +165,24 @@ async function composeVoucherImage(voucher, qrDataUrl) {
 
 const formatCurrency = (value) => Number(value || 0).toFixed(2);
 
+// Deixa o texto em minusculo e sem acento, para a busca achar "Stefany"
+// digitando "Stefany" com ou sem acento, nos dois sentidos.
+// O regex e montado por escape para nao depender do encoding deste arquivo.
+const COMBINING_MARKS = new RegExp('[\\u0300-\\u036f]', 'g');
+
+const normalizeText = (value) => String(value ?? '')
+  .normalize('NFD')
+  .replace(COMBINING_MARKS, '')
+  .toLowerCase()
+  .trim();
+
+// Id unico por carrinho, usado para o servidor descartar reenvios da mesma venda
+const newRequestId = () => (
+  window.crypto?.randomUUID
+    ? window.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+);
+
 // Formata data/hora no fuso de Brasília. O banco grava em UTC (sem indicador de fuso),
 // então marcamos como UTC (Z) antes de converter para America/Sao_Paulo.
 function formatDateTimeBR(value, dateOnly = false) {
@@ -385,6 +403,11 @@ function App() {
 
   const [tabValue, setTabValue] = useState('resumo');
   const [cart, setCart] = useState([]);
+  // Trava contra venda duplicada: bloqueia o botao enquanto a venda esta sendo
+  // gravada e manda um id unico por carrinho para o servidor ignorar reenvios.
+  const [savingSale, setSavingSale] = useState(false);
+  const saleRequestIdRef = useRef(null);
+  const [cancellingSaleId, setCancellingSaleId] = useState(null);
   const [products, setProducts] = useState([]);
   const [categoryCosts, setCategoryCosts] = useState([]);
   const [customers, setCustomers] = useState([]);
@@ -528,13 +551,19 @@ function App() {
       setPaymentMethods(methodsRes.data);
 
       if (userIsAdmin) {
-        const [salesRes, usersRes, summaryRes, categoryCostsRes] = await Promise.all([
+        // Cada bloco e tratado em separado: se o resumo falhar, o resto da tela
+        // continua valendo — e o erro aparece, em vez de mostrar R$ 0,00 calado.
+        const [salesRes, usersRes, summaryRes, categoryCostsRes] = await Promise.allSettled([
           api.get('/sales/'), api.get('/users/'), api.get('/reports/summary'), api.get('/category-costs/')
         ]);
-        setSalesHistory(salesRes.data);
-        setUsers(usersRes.data);
-        setReportSummary(summaryRes.data);
-        setCategoryCosts(categoryCostsRes.data);
+        if (salesRes.status === 'fulfilled') setSalesHistory(salesRes.value.data);
+        if (usersRes.status === 'fulfilled') setUsers(usersRes.value.data);
+        if (categoryCostsRes.status === 'fulfilled') setCategoryCosts(categoryCostsRes.value.data);
+        if (summaryRes.status === 'fulfilled') {
+          setReportSummary(summaryRes.value.data);
+        } else if (salesRes.status === 'rejected' || summaryRes.status === 'rejected') {
+          showFeedback('Não consegui carregar o resumo agora. Os valores podem estar incompletos — atualize a página.', 'warning');
+        }
       } else {
         setSalesHistory([]);
         setUsers([]);
@@ -778,7 +807,7 @@ function App() {
   const categoryOptions = [...new Set(products.map((p) => p.category || 'Geral'))].sort();
 
   const filteredCustomers = customers
-    .filter(c => c.name.toLowerCase().includes(searchTerm.toLowerCase()))
+    .filter(c => normalizeText(c.name).includes(normalizeText(searchTerm)))
     .sort((a, b) => clientSort === 'grupo'
       ? (a.group_name || 'zzz').localeCompare(b.group_name || 'zzz') || a.name.localeCompare(b.name)
       : a.name.localeCompare(b.name));
@@ -790,9 +819,9 @@ function App() {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [customers]);
   const filteredProducts = products.filter(p => {
-    const term = searchTermProduct.trim().toLowerCase();
+    const term = normalizeText(searchTermProduct);
     if (!term) return true;
-    return p.name.toLowerCase().includes(term) || (p.barcode || '').toLowerCase() === term;
+    return normalizeText(p.name).includes(term) || normalizeText(p.barcode) === term;
   }).sort((a, b) => a.name.localeCompare(b.name));
 
   // Leitor USB no notebook: o leitor "digita" o código e envia Enter
@@ -826,6 +855,7 @@ function App() {
   const removeFromCart = (id) => setCart(cart.filter(i => i.id !== id));
 
   const handleFinishSale = async (isPaid) => {
+    if (savingSale) return;
     if (!selectedCustomer) return showFeedback('Selecione cliente!', 'warning');
     if (cart.length === 0) return showFeedback('Carrinho vazio!', 'warning');
     const paymentMethod = isPaid ? selectedPaymentMethod : 'fiado';
@@ -833,21 +863,33 @@ function App() {
     if (paymentMethod === 'fiado' && selectedCustomerObj?.name === 'Consumidor Final') {
       return showFeedback('Fiado exige cliente identificado. Selecione ou cadastre o cliente.', 'warning');
     }
+    // Mesmo carrinho = mesmo id. Se a requisicao for enviada duas vezes, o
+    // servidor reconhece e devolve a venda ja gravada em vez de duplicar.
+    if (!saleRequestIdRef.current) saleRequestIdRef.current = newRequestId();
+    setSavingSale(true);
     try {
       const items = cart.map((p) => ({ product_id: p.id, quantity: p.quantity }));
-      await api.post('/sales/', {
+      const { data } = await api.post('/sales/', {
         customer_id: parseInt(selectedCustomer),
         items,
         is_paid: paymentMethod !== 'fiado',
         payment_method: paymentMethod,
-        payment_provider: null
+        payment_provider: null,
+        client_request_id: saleRequestIdRef.current
       });
-      showFeedback(paymentMethod === 'fiado' ? "FIADO anotado!" : "Venda registrada!", paymentMethod === 'fiado' ? 'info' : 'success');
+      if (data?.duplicate) {
+        showFeedback('Esta venda já tinha sido registrada — não foi lançada de novo.', 'info');
+      } else {
+        showFeedback(paymentMethod === 'fiado' ? "FIADO anotado!" : "Venda registrada!", paymentMethod === 'fiado' ? 'info' : 'success');
+      }
+      saleRequestIdRef.current = null;
       setCart([]);
       setCartOpen(false);
       fetchData();
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Erro na venda.', 'error');
+    } finally {
+      setSavingSale(false);
     }
   };
 
@@ -894,23 +936,32 @@ function App() {
 
   // Registra a venda de PIX confirmada (automática ou manual)
   const finalizePixSale = async (orderId) => {
+    // O PIX pode ser fechado pelo timer automático e pelo botão manual ao mesmo
+    // tempo — sem essa trava a venda entrava duas vezes.
+    if (savingSale || cart.length === 0) return;
+    if (!saleRequestIdRef.current) saleRequestIdRef.current = newRequestId();
+    setSavingSale(true);
     try {
       const items = cart.map((p) => ({ product_id: p.id, quantity: p.quantity }));
-      await api.post('/sales/', {
+      const { data } = await api.post('/sales/', {
         customer_id: parseInt(selectedCustomer),
         items,
         is_paid: true,
         payment_method: 'pix',
         payment_provider: orderId ? 'pagbank' : null,
-        payment_reference: orderId || null
+        payment_reference: orderId || null,
+        client_request_id: saleRequestIdRef.current
       });
-      showFeedback('Pagamento PIX confirmado!', 'success');
+      showFeedback(data?.duplicate ? 'Esta venda já tinha sido registrada.' : 'Pagamento PIX confirmado!', data?.duplicate ? 'info' : 'success');
+      saleRequestIdRef.current = null;
       setCart([]);
       setCartOpen(false);
       setPixDialog(prev => ({ ...prev, open: false }));
       fetchData();
     } catch (error) {
       showFeedback(error.response?.data?.detail || 'Pago, mas houve erro ao registrar a venda.', 'error');
+    } finally {
+      setSavingSale(false);
     }
   };
 
@@ -1092,12 +1143,22 @@ function App() {
     const itens = (sale.items || []).map((it) => `${it.quantity}x ${it.product?.name || 'item'}`).join(', ');
     const confirmMsg = `Cancelar esta venda de R$ ${formatCurrency(sale.total_value)} (${sale.customer?.name || 'Consumidor Final'})?\n\nItens: ${itens || '—'}\n\nO estoque será devolvido${!sale.is_paid ? ' e a dívida do cliente será reduzida' : ''}. Esta ação não pode ser desfeita.`;
     if (!window.confirm(confirmMsg)) return;
+    if (cancellingSaleId) return;
+    setCancellingSaleId(sale.id);
     try {
       await api.post(`/sales/${sale.id}/cancel`);
+      // Tira a linha da lista na hora, para nao dar chance de cancelar de novo
+      // enquanto os dados nao voltam do servidor.
+      setSalesHistory(prev => prev.filter(s => s.id !== sale.id));
       showFeedback('Venda cancelada e estoque restaurado!', 'success');
       fetchData();
     } catch (error) {
-      showFeedback(error.response?.data?.detail || 'Erro ao cancelar venda', 'error');
+      const detail = error.response?.data?.detail || 'Erro ao cancelar venda';
+      // Se ela ja tinha sido cancelada, some com a linha do mesmo jeito
+      if (error.response?.status === 404) setSalesHistory(prev => prev.filter(s => s.id !== sale.id));
+      showFeedback(detail, error.response?.status === 404 ? 'info' : 'error');
+    } finally {
+      setCancellingSaleId(null);
     }
   };
 
@@ -1536,11 +1597,13 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         fullWidth
         variant="contained"
         color={selectedPaymentMethod === 'fiado' ? 'warning' : 'success'}
-        startIcon={selectedPaymentMethod === 'pix' ? <QrCode2 /> : null}
+        startIcon={savingSale ? <CircularProgress size={18} color="inherit" /> : (selectedPaymentMethod === 'pix' ? <QrCode2 /> : null)}
         onClick={() => selectedPaymentMethod === 'pix' ? startPixCharge() : handleFinishSale(selectedPaymentMethod !== 'fiado')}
-        disabled={cart.length === 0}
+        disabled={cart.length === 0 || savingSale}
       >
-        {selectedPaymentMethod === 'fiado' ? 'Anotar Fiado' : selectedPaymentMethod === 'pix' ? 'Cobrar via PIX' : 'Finalizar Venda'}
+        {savingSale
+          ? 'Registrando...'
+          : selectedPaymentMethod === 'fiado' ? 'Anotar Fiado' : selectedPaymentMethod === 'pix' ? 'Cobrar via PIX' : 'Finalizar Venda'}
       </Button>
     </Box>
   );
@@ -1692,7 +1755,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                           <TableCell>R$ {formatCurrency(sale.total_value)}</TableCell>
                           <TableCell><Chip label={sale.payment_method_label || (sale.is_paid ? "PAGO" : "FIADO")} color={sale.is_paid ? "success" : "warning"} size="small" variant="outlined" /></TableCell>
                           <TableCell align="center">
-                            <IconButton size="small" color="error" title="Cancelar venda (devolve o estoque)" onClick={() => handleCancelSale(sale)}><Delete fontSize="small" /></IconButton>
+                            <IconButton size="small" color="error" title="Cancelar venda (devolve o estoque)" disabled={cancellingSaleId === sale.id} onClick={() => handleCancelSale(sale)}><Delete fontSize="small" /></IconButton>
                           </TableCell>
                         </TableRow>
                       ))}
@@ -1868,11 +1931,11 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }}
             />
             {(() => {
-              const term = stockQuery.trim().toLowerCase();
+              const term = normalizeText(stockQuery);
               const categorias = Array.from(new Set(products.map((p) => p.category || 'Geral'))).sort((a, b) => a.localeCompare(b));
               const list = [...products]
                 .filter((p) => !stockCategoryFilter || (p.category || 'Geral') === stockCategoryFilter)
-                .filter((p) => !term || p.name.toLowerCase().includes(term) || (p.category || '').toLowerCase().includes(term) || (p.barcode || '').includes(term))
+                .filter((p) => !term || normalizeText(p.name).includes(term) || normalizeText(p.category).includes(term) || normalizeText(p.barcode).includes(term))
                 .sort((a, b) => a.name.localeCompare(b.name));
               const totalUnidades = list.reduce((s, p) => s + (p.stock || 0), 0);
               return (
@@ -2107,10 +2170,10 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               })()}
             </Paper>
             {(() => {
-              const term = estoqueQuery.trim().toLowerCase();
+              const term = normalizeText(estoqueQuery);
               const filteredEstoque = products
                 .filter((p) => !estoqueCategoryFilter || (p.category || 'Geral') === estoqueCategoryFilter)
-                .filter((p) => !term || p.name.toLowerCase().includes(term) || (p.category || '').toLowerCase().includes(term) || (p.barcode || '').toLowerCase().includes(term));
+                .filter((p) => !term || normalizeText(p.name).includes(term) || normalizeText(p.category).includes(term) || normalizeText(p.barcode).includes(term));
               return (
             <TableContainer component={Paper}>
               <Table size="small">

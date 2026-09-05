@@ -340,6 +340,33 @@ async function getSaleItems(db, saleId) {
   return rows.map(serializeSaleItem);
 }
 
+// Busca os itens de varias vendas de uma vez so.
+// Evita o padrao "1 query por venda", que estourava o limite de subrequisicoes
+// do Worker conforme o numero de vendas crescia e derrubava o Resumo.
+async function getSaleItemsBulk(db, saleIds) {
+  const map = new Map();
+  if (!saleIds.length) return map;
+  const CHUNK = 200;
+  for (let i = 0; i < saleIds.length; i += CHUNK) {
+    const chunk = saleIds.slice(i, i + CHUNK);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = await all(db, `
+      SELECT si.*, p.name AS product_name, p.category AS product_category,
+             p.barcode AS product_barcode
+      FROM sale_items si
+      LEFT JOIN products p ON p.id = si.product_id
+      WHERE si.sale_id IN (${placeholders})
+      ORDER BY si.sale_id, si.id
+    `, ...chunk);
+    for (const row of rows) {
+      const list = map.get(row.sale_id) || [];
+      list.push(serializeSaleItem(row));
+      map.set(row.sale_id, list);
+    }
+  }
+  return map;
+}
+
 async function getCurrentUser(request, env, db) {
   const auth = request.headers.get('authorization') || '';
   const match = auth.match(/^Bearer\s+(.+)$/i);
@@ -941,9 +968,8 @@ async function listSales(db) {
     LEFT JOIN customers c ON c.id = s.customer_id
     ORDER BY datetime(s.created_at) DESC, s.id DESC
   `);
-  const sales = [];
-  for (const row of rows) sales.push(serializeSale(row, await getSaleItems(db, row.id)));
-  return sales;
+  const itemsBySale = await getSaleItemsBulk(db, rows.map((r) => r.id));
+  return rows.map((row) => serializeSale(row, itemsBySale.get(row.id) || []));
 }
 
 async function listCustomerSales(db, customerId) {
@@ -955,9 +981,8 @@ async function listCustomerSales(db, customerId) {
     WHERE s.customer_id = ?
     ORDER BY datetime(s.created_at) DESC, s.id DESC
   `, customerId);
-  const sales = [];
-  for (const row of rows) sales.push(serializeSale(row, await getSaleItems(db, row.id)));
-  return sales;
+  const itemsBySale = await getSaleItemsBulk(db, rows.map((r) => r.id));
+  return rows.map((row) => serializeSale(row, itemsBySale.get(row.id) || []));
 }
 
 // Cancela uma venda: devolve o estoque de cada item, reverte a divida (se era fiado) e apaga o registro.
@@ -978,6 +1003,18 @@ async function cancelSale(db, id) {
 
 async function createSale(request, db, user) {
   const data = await readJson(request);
+
+  // Idempotencia: o app manda um id unico por carrinho. Se a mesma requisicao
+  // chegar duas vezes (duplo clique, rede lenta, reenvio), devolve a venda que
+  // ja foi gravada em vez de criar outra e baixar o estoque de novo.
+  const clientRequestId = String(data.client_request_id || '').slice(0, 64) || null;
+  if (clientRequestId) {
+    const existing = await first(db, 'SELECT id FROM sales WHERE client_request_id = ?', clientRequestId);
+    if (existing) {
+      return { message: 'Venda ja registrada', duplicate: true, sale: await getSale(db, existing.id) };
+    }
+  }
+
   const paymentMethod = normalizePaymentMethod(data.payment_method || 'dinheiro');
   const eventDay = normalizeEventDay(data.event_day) || 'Dia 1';
   let isPaid = data.is_paid === undefined || data.is_paid === null ? paymentMethod !== 'fiado' : Boolean(data.is_paid);
@@ -1022,9 +1059,10 @@ async function createSale(request, db, user) {
   const result = await run(db, `
     INSERT INTO sales (
       customer_id, seller_username, total_value, is_paid, payment_method,
-      payment_status, payment_provider, payment_reference, event_day, created_at
+      payment_status, payment_provider, payment_reference, event_day,
+      client_request_id, created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
   `,
   customer.id,
   user.username,
@@ -1034,7 +1072,8 @@ async function createSale(request, db, user) {
   isPaid ? 'paid' : 'pending',
   data.payment_provider || null,
   data.payment_reference || null,
-  eventDay);
+  eventDay,
+  clientRequestId);
 
   const saleId = lastRowId(result);
   for (const item of saleItems) {
@@ -1087,8 +1126,10 @@ async function salesSummary(request, db) {
   let debtTotal = 0;
   const sales = [];
 
+  const itemsBySale = await getSaleItemsBulk(db, rows.map((r) => r.id));
+
   for (const row of rows) {
-    const items = await getSaleItems(db, row.id);
+    const items = itemsBySale.get(row.id) || [];
     const sale = serializeSale(row, items);
     sales.push(sale);
     const method = sale.payment_method;

@@ -110,6 +110,7 @@ class Sale(Base):
     payment_provider = Column(String(30), nullable=True)
     payment_reference = Column(String(200), nullable=True)
     event_day = Column(String(40), default="Dia 1")
+    client_request_id = Column(String(64), nullable=True, unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     customer = relationship("Customer")
@@ -229,6 +230,7 @@ class SaleCreate(BaseModel):
     event_day: Optional[str] = None
     payment_provider: Optional[str] = None
     payment_reference: Optional[str] = None
+    client_request_id: Optional[str] = None
 
 
 class BulkCustomerItem(BaseModel):
@@ -1179,6 +1181,14 @@ def cancel_sale(id: int, db: Session = Depends(get_db), u: User = Depends(requir
 
 @app.post("/sales/")
 def create_sale(sale: SaleCreate, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    # Idempotência: mesma requisição enviada duas vezes (duplo clique, rede lenta)
+    # devolve a venda já gravada em vez de criar outra e baixar o estoque de novo.
+    client_request_id = (sale.client_request_id or "")[:64] or None
+    if client_request_id:
+        existing = db.query(Sale).filter(Sale.client_request_id == client_request_id).first()
+        if existing:
+            return {"message": "Venda já registrada", "duplicate": True, "sale": serialize_sale(existing)}
+
     total = 0.0
     payment_method = normalize_payment_method(sale.payment_method)
     event_day = normalize_event_day(sale.event_day)
@@ -1228,7 +1238,8 @@ def create_sale(sale: SaleCreate, db: Session = Depends(get_db), u: User = Depen
         payment_status="paid" if is_paid else "pending",
         payment_provider=sale.payment_provider or None,
         payment_reference=sale.payment_reference,
-        event_day=event_day
+        event_day=event_day,
+        client_request_id=client_request_id
     )
     db.add(db_sale)
     db.flush()
