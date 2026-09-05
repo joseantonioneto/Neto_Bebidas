@@ -18,7 +18,7 @@ import {
   AdminPanelSettings, Remove, Download, PointOfSale, QrCodeScanner,
   CameraAlt, UploadFile, Close, People, CloudUpload,
   PhotoCamera, ContentCopy, ManageSearch, QrCode2, CheckCircle, AccessTime,
-  ConfirmationNumber, Share, Fastfood, ReceiptLong, Refresh
+  ConfirmationNumber, Share, Fastfood, ReceiptLong, Refresh, PriceCheck
 } from '@mui/icons-material';
 
 import QRCode from 'qrcode';
@@ -469,7 +469,19 @@ function App() {
   const [categoryCostForm, setCategoryCostForm] = useState({ description: '', category: 'Geral', amount: '', event_day: 'Dia 1' });
 
   const [openPayDialog, setOpenPayDialog] = useState(false);
-  const [payData, setPayData] = useState({ customerId: null, customerName: '', amount: '' });
+  const [payData, setPayData] = useState({ customerId: null, customerName: '', amount: '', debt: 0 });
+  // Trava da baixa de fiado: sem isso o duplo clique descontava o valor 2x
+  const [savingPayment, setSavingPayment] = useState(false);
+  const payRequestIdRef = useRef(null);
+  // Modulo de Baixas
+  const [payments, setPayments] = useState([]);
+  const [paymentsTotal, setPaymentsTotal] = useState(0);
+  const [paymentsSum, setPaymentsSum] = useState(0);
+  const [paymentsPage, setPaymentsPage] = useState(0);
+  const [paymentsPerPage, setPaymentsPerPage] = useState(25);
+  const [paymentsQuery, setPaymentsQuery] = useState('');
+  const [loadingPayments, setLoadingPayments] = useState(false);
+  const [cancellingPaymentId, setCancellingPaymentId] = useState(null);
 
   const [openUserDialog, setOpenUserDialog] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
@@ -616,6 +628,27 @@ function App() {
     }
   }, [salesPerPage, salesPage, salesQuery, salesStatusFilter, salesMethodFilter, showFeedback]);
 
+  // Baixas de fiado — carrega paginado, so com a aba aberta
+  const fetchPaymentsPage = useCallback(async (opts = {}) => {
+    setLoadingPayments(true);
+    try {
+      const { data } = await api.get('/payments', {
+        params: {
+          limit: opts.perPage ?? paymentsPerPage,
+          offset: (opts.page ?? paymentsPage) * (opts.perPage ?? paymentsPerPage),
+          search: opts.search ?? paymentsQuery
+        }
+      });
+      setPayments(data.items || []);
+      setPaymentsTotal(data.total || 0);
+      setPaymentsSum(data.total_amount || 0);
+    } catch {
+      showFeedback('Não consegui carregar as baixas.', 'error');
+    } finally {
+      setLoadingPayments(false);
+    }
+  }, [paymentsPerPage, paymentsPage, paymentsQuery, showFeedback]);
+
   const addToCart = useCallback((p) => {
     if (p.stock <= 0) return showFeedback('Sem estoque!', 'warning');
     setCart(prev => {
@@ -652,6 +685,13 @@ function App() {
     const timeoutId = window.setTimeout(() => { fetchSalesPage(); }, salesQuery ? 350 : 0);
     return () => window.clearTimeout(timeoutId);
   }, [token, isAdmin, tabValue, salesQuery, fetchSalesPage]);
+
+  // Baixas: so busca com a aba aberta, esperando a digitacao parar
+  useEffect(() => {
+    if (!token || !isAdmin || tabValue !== 'baixas') return undefined;
+    const timeoutId = window.setTimeout(() => { fetchPaymentsPage(); }, paymentsQuery ? 350 : 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [token, isAdmin, tabValue, paymentsQuery, fetchPaymentsPage]);
 
   // Atualiza o estoque em tempo real enquanto a aba Consulta estiver aberta
   useEffect(() => {
@@ -1170,12 +1210,49 @@ function App() {
   };
 
   const handlePayDebt = async () => {
-    if (!payData.amount || payData.amount <= 0) return;
+    if (savingPayment) return;
+    const valor = parseFloat(payData.amount);
+    if (!valor || valor <= 0) return;
+    if (valor > payData.debt + 0.001) {
+      return showFeedback(`Valor maior que a dívida. ${payData.customerName} deve R$ ${formatCurrency(payData.debt)}.`, 'warning');
+    }
+    if (!payRequestIdRef.current) payRequestIdRef.current = newRequestId();
+    setSavingPayment(true);
     try {
-      await api.post(`/customers/${payData.customerId}/pay/`, { amount: parseFloat(payData.amount) });
-      showFeedback('Pagamento registrado!', 'success');
-      setOpenPayDialog(false); fetchData();
-    } catch { showFeedback('Erro ao pagar.', 'error'); }
+      const { data } = await api.post(`/customers/${payData.customerId}/pay/`, {
+        amount: valor,
+        client_request_id: payRequestIdRef.current
+      });
+      showFeedback(data?.duplicate ? 'Esta baixa já tinha sido registrada.' : 'Pagamento registrado!', data?.duplicate ? 'info' : 'success');
+      payRequestIdRef.current = null;
+      setOpenPayDialog(false);
+      fetchData();
+      if (tabValue === 'baixas') fetchPaymentsPage();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao pagar.', 'error');
+    } finally {
+      setSavingPayment(false);
+    }
+  };
+
+  const handleCancelPayment = async (pagamento) => {
+    const msg = `Estornar a baixa de R$ ${formatCurrency(pagamento.amount)} de ${pagamento.customer_name}?
+
+O valor volta para a dívida do cliente.`;
+    if (!window.confirm(msg)) return;
+    if (cancellingPaymentId) return;
+    setCancellingPaymentId(pagamento.id);
+    try {
+      await api.post(`/payments/${pagamento.id}/cancel`);
+      setPayments(prev => prev.filter(x => x.id !== pagamento.id));
+      showFeedback('Baixa estornada — o valor voltou para a dívida.', 'success');
+      fetchData();
+      fetchPaymentsPage();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao estornar baixa', 'error');
+    } finally {
+      setCancellingPaymentId(null);
+    }
   };
 
   const handleCancelSale = async (sale) => {
@@ -1669,6 +1746,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <Tab value="clientes" label="Clientes" icon={<People />} />
             <Tab value="estoque" label="Estoque" icon={<Inventory />} />
             {isAdmin && <Tab value="vendas" label="Vendas" icon={<ReceiptLong />} />}
+            {isAdmin && <Tab value="baixas" label="Baixas" icon={<PriceCheck />} />}
             {isAdmin && <Tab value="usuarios" label="Usuários" icon={<AdminPanelSettings />} />}
             {isAdmin && <Tab value="atividade" label="Atividade" icon={<Storage />} />}
           </Tabs>
@@ -1897,6 +1975,107 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 onPageChange={(e, novaPagina) => setSalesPage(novaPagina)}
                 rowsPerPage={salesPerPage}
                 onRowsPerPageChange={(e) => { setSalesPerPage(parseInt(e.target.value, 10)); setSalesPage(0); }}
+                rowsPerPageOptions={[25, 50, 100]}
+                labelRowsPerPage="Por página"
+                labelDisplayedRows={({ from, to, count }) => `${from}-${to} de ${count}`}
+              />
+            </Paper>
+          </Container>
+        )}
+
+        {/* === ABA BAIXAS (pagamentos de fiado — somente admin) === */}
+        {tabValue === 'baixas' && isAdmin && (
+          <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
+            <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
+              <Typography variant="h5">Baixas de Fiado</Typography>
+              <Button size="small" startIcon={<Refresh />} onClick={() => fetchPaymentsPage()} disabled={loadingPayments}>
+                Atualizar
+              </Button>
+            </Box>
+
+            <Grid container spacing={2} sx={{ mb: 2 }}>
+              <Grid size={{ xs: 6, md: 3 }}>
+                <Paper sx={{ p: 2, borderLeft: '5px solid #4caf50' }}>
+                  <Typography variant="caption" color="text.secondary">Total recebido</Typography>
+                  <Typography variant={isMobile ? 'h6' : 'h5'} fontWeight="bold" color="success.main">
+                    R$ {formatCurrency(paymentsSum)}
+                  </Typography>
+                </Paper>
+              </Grid>
+              <Grid size={{ xs: 6, md: 3 }}>
+                <Paper sx={{ p: 2, borderLeft: '5px solid #2196f3' }}>
+                  <Typography variant="caption" color="text.secondary">Baixas registradas</Typography>
+                  <Typography variant={isMobile ? 'h6' : 'h5'} fontWeight="bold">{paymentsTotal}</Typography>
+                </Paper>
+              </Grid>
+              <Grid size={{ xs: 12, md: 6 }}>
+                <TextField
+                  fullWidth size="small" label="Buscar cliente ou quem recebeu"
+                  placeholder="Funciona com ou sem acento"
+                  value={paymentsQuery}
+                  onChange={(e) => { setPaymentsQuery(e.target.value); setPaymentsPage(0); }}
+                  InputProps={{ startAdornment: <Search fontSize="small" sx={{ mr: 1, color: 'text.secondary' }} /> }}
+                  sx={{ mt: { xs: 0, md: 1 } }}
+                />
+              </Grid>
+            </Grid>
+
+            <Paper>
+              {loadingPayments && <LinearProgress />}
+              <TableContainer sx={{ maxHeight: isMobile ? 420 : 560 }}>
+                <Table stickyHeader size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Data</TableCell>
+                      <TableCell>Cliente</TableCell>
+                      <TableCell align="right">Valor pago</TableCell>
+                      {!isMobile && <TableCell align="right">Ainda deve</TableCell>}
+                      {!isMobile && <TableCell>Recebido por</TableCell>}
+                      <TableCell align="center">Ação</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {payments.map((pg) => (
+                      <TableRow key={pg.id} hover>
+                        <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatDateTimeBR(pg.created_at)}</TableCell>
+                        <TableCell>{pg.customer_name || '---'}</TableCell>
+                        <TableCell align="right" sx={{ whiteSpace: 'nowrap', color: 'success.main', fontWeight: 600 }}>
+                          R$ {formatCurrency(pg.amount)}
+                        </TableCell>
+                        {!isMobile && (
+                          <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                            {pg.customer_debt > 0
+                              ? <Typography variant="body2" color="warning.main">R$ {formatCurrency(pg.customer_debt)}</Typography>
+                              : <Chip label="Quitado" color="success" size="small" variant="outlined" />}
+                          </TableCell>
+                        )}
+                        {!isMobile && <TableCell>{pg.username || '---'}</TableCell>}
+                        <TableCell align="center">
+                          <IconButton size="small" color="error" title="Estornar baixa (devolve o valor para a dívida)"
+                            disabled={cancellingPaymentId === pg.id}
+                            onClick={() => handleCancelPayment(pg)}>
+                            <Delete fontSize="small" />
+                          </IconButton>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                    {!loadingPayments && payments.length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={isMobile ? 4 : 6} align="center" sx={{ py: 4, color: 'text.secondary' }}>
+                          Nenhuma baixa registrada ainda.
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <TablePagination
+                component="div"
+                count={paymentsTotal}
+                page={paymentsPage}
+                onPageChange={(e, novaPagina) => setPaymentsPage(novaPagina)}
+                rowsPerPage={paymentsPerPage}
+                onRowsPerPageChange={(e) => { setPaymentsPerPage(parseInt(e.target.value, 10)); setPaymentsPage(0); }}
                 rowsPerPageOptions={[25, 50, 100]}
                 labelRowsPerPage="Por página"
                 labelDisplayedRows={({ from, to, count }) => `${from}-${to} de ${count}`}
@@ -2208,7 +2387,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                       <TableCell align="right" sx={{ fontWeight: 'bold', color: row.debt > 0 ? 'red' : 'green' }}>R$ {formatCurrency(row.debt)}</TableCell>
                       <TableCell align="center">
                         {row.debt > 0 ? (
-                          <Button size="small" variant="outlined" color="success" onClick={() => { setPayData({ customerId: row.id, customerName: row.name, amount: '' }); setOpenPayDialog(true); }}>Pagar</Button>
+                          <Button size="small" variant="outlined" color="success" onClick={() => { payRequestIdRef.current = newRequestId(); setPayData({ customerId: row.id, customerName: row.name, amount: '', debt: row.debt }); setOpenPayDialog(true); }}>Pagar</Button>
                         ) : (
                           <Chip label="OK" color="success" size="small" />
                         )}
@@ -2413,6 +2592,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <BottomNavigationAction label="Clientes" value="clientes" icon={<People />} />
             <BottomNavigationAction label="Estoque" value="estoque" icon={<Inventory />} />
             {isAdmin && <BottomNavigationAction label="Vendas" value="vendas" icon={<ReceiptLong />} />}
+            {isAdmin && <BottomNavigationAction label="Baixas" value="baixas" icon={<PriceCheck />} />}
             {isAdmin && <BottomNavigationAction label="Usuários" value="usuarios" icon={<AdminPanelSettings />} />}
             {isAdmin && <BottomNavigationAction label="Atividade" value="atividade" icon={<Storage />} />}
           </BottomNavigation>
@@ -2903,11 +3083,20 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
       <Dialog open={openPayDialog} onClose={() => setOpenPayDialog(false)}>
         <DialogTitle>Pagar dívida - {payData.customerName}</DialogTitle>
         <DialogContent>
-          <TextField label="Valor (R$)" type="number" fullWidth value={payData.amount} onChange={(e) => setPayData({ ...payData, amount: e.target.value })} autoFocus sx={{ mt: 1 }} />
+          <Alert severity="info" sx={{ mt: 1, mb: 2 }}>
+            Dívida atual: <strong>R$ {formatCurrency(payData.debt)}</strong>
+          </Alert>
+          <TextField label="Valor (R$)" type="number" fullWidth value={payData.amount} onChange={(e) => setPayData({ ...payData, amount: e.target.value })} autoFocus />
+          <Button size="small" sx={{ mt: 1 }} onClick={() => setPayData({ ...payData, amount: String(payData.debt) })}>
+            Pagar tudo (R$ {formatCurrency(payData.debt)})
+          </Button>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setOpenPayDialog(false)}>Cancelar</Button>
-          <Button onClick={handlePayDebt} variant="contained" color="success">Pagar</Button>
+          <Button onClick={() => setOpenPayDialog(false)} disabled={savingPayment}>Cancelar</Button>
+          <Button onClick={handlePayDebt} variant="contained" color="success" disabled={savingPayment}
+            startIcon={savingPayment ? <CircularProgress size={18} color="inherit" /> : null}>
+            {savingPayment ? 'Registrando...' : 'Pagar'}
+          </Button>
         </DialogActions>
       </Dialog>
 

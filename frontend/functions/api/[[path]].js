@@ -883,14 +883,84 @@ async function deleteCustomer(db, id) {
   return { message: 'Cliente excluido' };
 }
 
-async function payDebt(request, db, id) {
+async function payDebt(request, db, id, user) {
   const data = await readJson(request);
   const amount = numberValue(data.amount);
   if (amount <= 0) throw new HttpError(400, 'Valor invalido');
+
+  // Idempotencia: duplo clique na baixa cobrava o cliente duas vezes e deixava
+  // a divida negativa. Se a mesma requisicao chegar de novo, devolve a anterior.
+  const clientRequestId = String(data.client_request_id || '').slice(0, 64) || null;
+  if (clientRequestId) {
+    const existing = await first(db, 'SELECT * FROM payments WHERE client_request_id = ?', clientRequestId);
+    if (existing) {
+      const atual = await first(db, 'SELECT debt FROM customers WHERE id = ?', id);
+      return { message: 'Baixa ja registrada', duplicate: true, debt: numberValue(atual?.debt), amount: numberValue(existing.amount) };
+    }
+  }
+
   const customer = await first(db, 'SELECT * FROM customers WHERE id = ?', id);
   if (!customer) throw new HttpError(404, 'Cliente nao encontrado');
-  await run(db, 'UPDATE customers SET debt = ? WHERE id = ?', numberValue(customer.debt) - amount, id);
-  return { message: 'Pago' };
+
+  const debt = numberValue(customer.debt);
+  // Recusa em vez de deixar a divida negativa: valor maior que o devido e
+  // quase sempre engano, e antes disso o saldo era corrompido em silencio.
+  if (amount > debt + 0.001) {
+    throw new HttpError(400, `Valor maior que a divida. ${customer.name} deve R$ ${debt.toFixed(2)}.`);
+  }
+
+  const novaDivida = Math.max(0, debt - amount);
+  await run(db, 'UPDATE customers SET debt = ? WHERE id = ?', novaDivida, id);
+  await run(db, `
+    INSERT INTO payments (customer_id, amount, username, note, client_request_id, created_at)
+    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+  `, id, amount, user?.username || null, data.note || null, clientRequestId);
+
+  return { message: 'Pago', debt: novaDivida, amount };
+}
+
+async function listPayments(db, opts = {}) {
+  const limit = opts.limit || 0;
+  const offset = opts.offset || 0;
+  const search = stripAccents(opts.search || '');
+
+  let rows = await all(db, `
+    SELECT p.*, c.name AS customer_name, c.group_name AS customer_group_name, c.debt AS customer_debt
+    FROM payments p
+    LEFT JOIN customers c ON c.id = p.customer_id
+    ORDER BY datetime(p.created_at) DESC, p.id DESC
+  `);
+
+  if (search) {
+    rows = rows.filter((r) => stripAccents(`${r.customer_name || ''} ${r.username || ''}`).includes(search));
+  }
+
+  const total = rows.length;
+  const somaTotal = rows.reduce((acc, r) => acc + numberValue(r.amount), 0);
+  const pageRows = limit ? rows.slice(offset, offset + limit) : rows;
+
+  const items = pageRows.map((row) => ({
+    id: row.id,
+    customer_id: row.customer_id,
+    customer_name: row.customer_name,
+    customer_group_name: row.customer_group_name,
+    customer_debt: numberValue(row.customer_debt),
+    amount: numberValue(row.amount),
+    username: row.username,
+    note: row.note,
+    created_at: row.created_at
+  }));
+
+  return { items, total, total_amount: somaTotal, limit, offset };
+}
+
+// Estorna uma baixa: devolve o valor para a divida do cliente e apaga o registro
+async function cancelPayment(db, id) {
+  const pagamento = await first(db, 'SELECT * FROM payments WHERE id = ?', id);
+  if (!pagamento) throw new HttpError(404, 'Baixa nao encontrada');
+  await run(db, 'UPDATE customers SET debt = debt + ? WHERE id = ?', numberValue(pagamento.amount), pagamento.customer_id);
+  await run(db, 'DELETE FROM payments WHERE id = ?', id);
+  return { message: 'Baixa estornada', amount: numberValue(pagamento.amount) };
 }
 
 async function bulkCreateCustomers(request, db) {
@@ -1400,7 +1470,7 @@ async function handle(request, env, params, ctx = {}) {
     }
     if (second && third === 'pay' && request.method === 'POST') {
       requireSellerOrAdmin(currentUser);
-      return json(await payDebt(request, db, intValue(second)));
+      return json(await payDebt(request, db, intValue(second), currentUser));
     }
     if (second && third === 'sales' && request.method === 'GET') {
       requireSellerOrAdmin(currentUser);
@@ -1413,6 +1483,21 @@ async function handle(request, env, params, ctx = {}) {
     if (second && request.method === 'DELETE') {
       requireAdmin(currentUser);
       return json(await deleteCustomer(db, intValue(second)));
+    }
+  }
+
+  if (resource === 'payments') {
+    requireAdmin(currentUser);
+    if (!second && request.method === 'GET') {
+      const q = new URL(request.url).searchParams;
+      return json(await listPayments(db, {
+        limit: intValue(q.get('limit')) || 0,
+        offset: intValue(q.get('offset')) || 0,
+        search: q.get('search') || ''
+      }));
+    }
+    if (second && third === 'cancel' && request.method === 'POST') {
+      return json(await cancelPayment(db, intValue(second)));
     }
   }
 
@@ -1650,6 +1735,7 @@ function describeAction(method, parts) {
   if (r === 'products' && s === 'import-nfe') return 'Importou NF-e';
   if (r === 'customers' && M === 'POST' && !s) return 'Cadastrou cliente';
   if (r === 'customers' && t === 'pay') return 'Recebeu pagamento de fiado';
+  if (r === 'payments' && t === 'cancel') return 'Estornou baixa de fiado';
   if (r === 'customers' && M === 'PUT') return 'Editou cliente';
   if (r === 'customers' && M === 'DELETE') return 'Excluiu cliente';
   if (r === 'customers' && (s === 'bulk' || s === 'import-csv')) return 'Importou clientes';
