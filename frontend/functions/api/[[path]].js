@@ -960,16 +960,51 @@ async function importCustomersCsv(request, db) {
   };
 }
 
-async function listSales(db) {
-  const rows = await all(db, `
+// Texto sem acento e em minusculo, para a busca casar com ou sem acento
+const COMBINING_MARKS = new RegExp('[\\u0300-\\u036f]', 'g');
+function stripAccents(value) {
+  return String(value ?? '').normalize('NFD').replace(COMBINING_MARKS, '').toLowerCase().trim();
+}
+
+// Lista de vendas com paginacao. Os itens de cada venda so sao buscados para a
+// pagina que vai ser exibida — e o que mantem o historico leve com o passar do evento.
+async function listSales(db, opts = {}) {
+  const limit = opts.limit || 0;
+  const offset = opts.offset || 0;
+  const search = stripAccents(opts.search || '');
+  const method = opts.method || '';
+  const status = opts.status || '';
+
+  const clauses = [];
+  const values = [];
+  if (method) {
+    clauses.push('s.payment_method = ?');
+    values.push(method);
+  }
+  if (status === 'fiado') clauses.push('s.is_paid = 0');
+  else if (status === 'pago') clauses.push('s.is_paid = 1');
+
+  let rows = await all(db, `
     SELECT s.*, c.name AS customer_name, c.phone AS customer_phone,
            c.group_name AS customer_group_name, c.debt AS customer_debt
     FROM sales s
     LEFT JOIN customers c ON c.id = s.customer_id
+    ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
     ORDER BY datetime(s.created_at) DESC, s.id DESC
-  `);
-  const itemsBySale = await getSaleItemsBulk(db, rows.map((r) => r.id));
-  return rows.map((row) => serializeSale(row, itemsBySale.get(row.id) || []));
+  `, ...values);
+
+  // O SQLite nao tem "unaccent", entao o filtro por nome e feito aqui
+  if (search) {
+    rows = rows.filter((r) => stripAccents(`${r.customer_name || ''} ${r.seller_username || ''}`).includes(search));
+  }
+
+  const total = rows.length;
+  const pageRows = limit ? rows.slice(offset, offset + limit) : rows;
+  const itemsBySale = await getSaleItemsBulk(db, pageRows.map((r) => r.id));
+  const items = pageRows.map((row) => serializeSale(row, itemsBySale.get(row.id) || []));
+
+  // Sem limit devolve o array puro (compatibilidade com o formato antigo)
+  return limit ? { items, total, limit, offset } : items;
 }
 
 async function listCustomerSales(db, customerId) {
@@ -1092,6 +1127,8 @@ async function salesSummary(request, db) {
   const eventDay = url.searchParams.get('event_day');
   const startDate = url.searchParams.get('start_date');
   const endDate = url.searchParams.get('end_date');
+  // Quando o grafico esta filtrado por produto, by_day passa a somar so ele
+  const chartProductId = intValue(url.searchParams.get('product_id')) || 0;
 
   const clauses = [];
   const values = [];
@@ -1121,6 +1158,7 @@ async function salesSummary(request, db) {
   const byEventDay = {};
   const byProduct = {};
   const bySeller = {};
+  const byDay = {};
   let grossTotal = 0;
   let directCostTotal = 0;
   let debtTotal = 0;
@@ -1142,9 +1180,13 @@ async function salesSummary(request, db) {
     byPayment[method].total += total;
 
     const day = formatDay(row.created_at);
-    byEventDay[day] ||= { event_day: day, date: sortableDate(row.created_at), count: 0, total: 0 };
+    const dayKey = sortableDate(row.created_at);
+    byEventDay[day] ||= { event_day: day, date: dayKey, count: 0, total: 0 };
     byEventDay[day].count += 1;
     byEventDay[day].total += total;
+
+    byDay[dayKey] ||= { date: dayKey, total: 0 };
+    if (!chartProductId) byDay[dayKey].total += total;
 
     const seller = sale.seller_username || 'desconhecido';
     bySeller[seller] ||= { seller, count: 0, total: 0 };
@@ -1155,6 +1197,7 @@ async function salesSummary(request, db) {
       const itemCost = item.quantity * item.unit_cost_price;
       const itemTotal = item.quantity * item.unit_sell_price;
       directCostTotal += itemCost;
+      if (chartProductId && item.product_id === chartProductId) byDay[dayKey].total += itemTotal;
       byProduct[item.product_id] ||= {
         product_id: item.product_id,
         name: item.product?.name || `Produto ${item.product_id}`,
@@ -1198,7 +1241,9 @@ async function salesSummary(request, db) {
     by_category_cost: Object.values(byCategoryCost).sort((a, b) => b.total - a.total),
     category_costs: categoryCosts,
     top_products: Object.values(byProduct).sort((a, b) => b.total - a.total),
-    sales
+    by_day: Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date))
+    // O array completo de vendas saiu daqui: o historico agora tem modulo
+    // proprio e pagina sob demanda, o que deixou o resumo bem mais leve.
   };
 }
 
@@ -1353,7 +1398,14 @@ async function handle(request, env, params, ctx = {}) {
   if (resource === 'sales') {
     if (!second && request.method === 'GET') {
       requireAdmin(currentUser);
-      return json(await listSales(db));
+      const q = new URL(request.url).searchParams;
+      return json(await listSales(db, {
+        limit: intValue(q.get('limit')) || 0,
+        offset: intValue(q.get('offset')) || 0,
+        search: q.get('search') || '',
+        method: q.get('method') || '',
+        status: q.get('status') || ''
+      }));
     }
     if (!second && request.method === 'POST') {
       requireSellerOrAdmin(currentUser);

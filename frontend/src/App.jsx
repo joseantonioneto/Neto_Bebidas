@@ -9,7 +9,7 @@ import {
   DialogContent, DialogActions, Badge, Chip, Autocomplete,
   BottomNavigation, BottomNavigationAction, Fab, Drawer,
   useMediaQuery, useTheme, Divider, LinearProgress, Switch,
-  FormControlLabel, CircularProgress
+  FormControlLabel, CircularProgress, TablePagination, Tooltip
 } from '@mui/material';
 
 import {
@@ -18,7 +18,7 @@ import {
   AdminPanelSettings, Remove, Download, PointOfSale, QrCodeScanner,
   CameraAlt, UploadFile, Close, People, CloudUpload,
   PhotoCamera, ContentCopy, ManageSearch, QrCode2, CheckCircle, AccessTime,
-  ConfirmationNumber, Share, Fastfood
+  ConfirmationNumber, Share, Fastfood, ReceiptLong, Refresh
 } from '@mui/icons-material';
 
 import QRCode from 'qrcode';
@@ -412,6 +412,14 @@ function App() {
   const [categoryCosts, setCategoryCosts] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [salesHistory, setSalesHistory] = useState([]);
+  // Modulo de Historico de Vendas: carrega sob demanda e paginado
+  const [salesTotal, setSalesTotal] = useState(0);
+  const [salesPage, setSalesPage] = useState(0);
+  const [salesPerPage, setSalesPerPage] = useState(25);
+  const [salesQuery, setSalesQuery] = useState('');
+  const [salesStatusFilter, setSalesStatusFilter] = useState('');
+  const [salesMethodFilter, setSalesMethodFilter] = useState('');
+  const [loadingSales, setLoadingSales] = useState(false);
   const [users, setUsers] = useState([]);
   const [reportSummary, setReportSummary] = useState(null);
   const [paymentMethods, setPaymentMethods] = useState(FALLBACK_PAYMENT_METHODS);
@@ -553,17 +561,13 @@ function App() {
       if (userIsAdmin) {
         // Cada bloco e tratado em separado: se o resumo falhar, o resto da tela
         // continua valendo — e o erro aparece, em vez de mostrar R$ 0,00 calado.
-        const [salesRes, usersRes, summaryRes, categoryCostsRes] = await Promise.allSettled([
-          api.get('/sales/'), api.get('/users/'), api.get('/reports/summary'), api.get('/category-costs/')
+        // O historico de vendas saiu daqui: agora tem aba propria e carrega
+        // paginado, so quando aberta. O resumo tem seu proprio efeito.
+        const [usersRes, categoryCostsRes] = await Promise.allSettled([
+          api.get('/users/'), api.get('/category-costs/')
         ]);
-        if (salesRes.status === 'fulfilled') setSalesHistory(salesRes.value.data);
         if (usersRes.status === 'fulfilled') setUsers(usersRes.value.data);
         if (categoryCostsRes.status === 'fulfilled') setCategoryCosts(categoryCostsRes.value.data);
-        if (summaryRes.status === 'fulfilled') {
-          setReportSummary(summaryRes.value.data);
-        } else if (salesRes.status === 'rejected' || summaryRes.status === 'rejected') {
-          showFeedback('Não consegui carregar o resumo agora. Os valores podem estar incompletos — atualize a página.', 'warning');
-        }
       } else {
         setSalesHistory([]);
         setUsers([]);
@@ -576,6 +580,41 @@ function App() {
       }
     }
   }, []);
+
+  // Resumo: consulta propria, para uma falha aqui nao derrubar o resto da tela.
+  // O product_id vai junto porque o total por dia do grafico e somado no servidor.
+  const fetchSummary = useCallback(async (productId) => {
+    try {
+      const { data } = await api.get('/reports/summary', {
+        params: productId ? { product_id: productId } : {}
+      });
+      setReportSummary(data);
+    } catch {
+      showFeedback('Não consegui carregar o resumo agora. Toque em atualizar para tentar de novo.', 'warning');
+    }
+  }, [showFeedback]);
+
+  // Historico de vendas paginado — so busca a pagina que esta na tela
+  const fetchSalesPage = useCallback(async (opts = {}) => {
+    setLoadingSales(true);
+    try {
+      const { data } = await api.get('/sales/', {
+        params: {
+          limit: opts.perPage ?? salesPerPage,
+          offset: (opts.page ?? salesPage) * (opts.perPage ?? salesPerPage),
+          search: opts.search ?? salesQuery,
+          status: opts.status ?? salesStatusFilter,
+          method: opts.method ?? salesMethodFilter
+        }
+      });
+      setSalesHistory(data.items || []);
+      setSalesTotal(data.total || 0);
+    } catch {
+      showFeedback('Não consegui carregar o histórico de vendas.', 'error');
+    } finally {
+      setLoadingSales(false);
+    }
+  }, [salesPerPage, salesPage, salesQuery, salesStatusFilter, salesMethodFilter, showFeedback]);
 
   const addToCart = useCallback((p) => {
     if (p.stock <= 0) return showFeedback('Sem estoque!', 'warning');
@@ -599,6 +638,20 @@ function App() {
     }, 0);
     return () => window.clearTimeout(timeoutId);
   }, [token, fetchData]);
+
+  // Resumo: carrega ao abrir a aba (assim reflete as vendas mais recentes) e
+  // refaz quando o filtro de produto do grafico muda
+  useEffect(() => {
+    if (!token || !isAdmin || tabValue !== 'resumo') return;
+    fetchSummary(productFilter?.id);
+  }, [token, isAdmin, tabValue, productFilter, fetchSummary]);
+
+  // Historico de vendas: so busca com a aba aberta, e espera a digitacao parar
+  useEffect(() => {
+    if (!token || !isAdmin || tabValue !== 'vendas') return undefined;
+    const timeoutId = window.setTimeout(() => { fetchSalesPage(); }, salesQuery ? 350 : 0);
+    return () => window.clearTimeout(timeoutId);
+  }, [token, isAdmin, tabValue, salesQuery, fetchSalesPage]);
 
   // Atualiza o estoque em tempo real enquanto a aba Consulta estiver aberta
   useEffect(() => {
@@ -772,30 +825,16 @@ function App() {
     return { totalCost, potentialProfit: potentialRevenue - totalCost };
   }, [products]);
 
+  // O servidor ja devolve o total por dia (respeitando o filtro de produto);
+  // aqui so recortamos a janela escolhida.
   const chartData = useMemo(() => {
     const cutoffDate = subDays(new Date(), daysFilter);
-    const dailyData = {};
-    salesHistory.forEach(sale => {
-      const saleDate = parseISO(sale.created_at);
-      if (!isAfter(saleDate, cutoffDate)) return;
-      const sortableDate = format(saleDate, 'yyyy-MM-dd');
-      if (productFilter) {
-        const hasProduct = sale.items && sale.items.some(item => item.product_id === productFilter.id);
-        if (!hasProduct) return;
-        const itemTotal = sale.items
-          .filter(item => item.product_id === productFilter.id)
-          .reduce((acc, item) => acc + (item.quantity * item.unit_sell_price), 0);
-        dailyData[sortableDate] = (dailyData[sortableDate] || 0) + itemTotal;
-      } else {
-        dailyData[sortableDate] = (dailyData[sortableDate] || 0) + sale.total_value;
-      }
-    });
-    return Object.entries(dailyData)
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([date, total]) => ({ day: format(parseISO(date), 'dd/MM'), total }));
-  }, [salesHistory, daysFilter, productFilter]);
+    return (reportSummary?.by_day || [])
+      .filter((row) => isAfter(parseISO(row.date), cutoffDate))
+      .map((row) => ({ day: format(parseISO(row.date), 'dd/MM'), total: row.total }));
+  }, [reportSummary, daysFilter]);
 
-  const totalSold = reportSummary?.totals?.gross_total ?? salesHistory.reduce((acc, sale) => acc + sale.total_value, 0);
+  const totalSold = reportSummary?.totals?.gross_total ?? 0;
   const totalDebtCurrent = customers.reduce((acc, customer) => acc + customer.debt, 0);
   const totalCash = reportSummary?.totals?.paid_total ?? (totalSold - totalDebtCurrent);
   const reportDebt = reportSummary?.totals?.debt_total ?? totalDebtCurrent;
@@ -1152,6 +1191,8 @@ function App() {
       setSalesHistory(prev => prev.filter(s => s.id !== sale.id));
       showFeedback('Venda cancelada e estoque restaurado!', 'success');
       fetchData();
+      fetchSalesPage();
+      fetchSummary(productFilter?.id);
     } catch (error) {
       const detail = error.response?.data?.detail || 'Erro ao cancelar venda';
       // Se ela ja tinha sido cancelada, some com a linha do mesmo jeito
@@ -1627,6 +1668,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <Tab value="consulta" label="Consulta" icon={<ManageSearch />} />
             <Tab value="clientes" label="Clientes" icon={<People />} />
             <Tab value="estoque" label="Estoque" icon={<Inventory />} />
+            {isAdmin && <Tab value="vendas" label="Vendas" icon={<ReceiptLong />} />}
             {isAdmin && <Tab value="usuarios" label="Usuários" icon={<AdminPanelSettings />} />}
             {isAdmin && <Tab value="atividade" label="Atividade" icon={<Storage />} />}
           </Tabs>
@@ -1741,30 +1783,139 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             )}
 
             <Grid size={12}>
-              <Paper sx={{ p: 2 }}>
-                <Typography variant="h6" gutterBottom>Histórico de Vendas</Typography>
-                <TableContainer sx={{ maxHeight: 300 }}>
-                  <Table stickyHeader size="small">
-                    <TableHead><TableRow><TableCell>Data</TableCell><TableCell>Cliente</TableCell><TableCell>Vendedor</TableCell><TableCell>Valor</TableCell><TableCell>Status</TableCell><TableCell align="center">Ação</TableCell></TableRow></TableHead>
-                    <TableBody>
-                      {salesHistory.map((sale) => (
-                        <TableRow key={sale.id}>
-                          <TableCell>{formatDateTimeBR(sale.created_at)}</TableCell>
-                          <TableCell>{sale.customer?.name || '---'}</TableCell>
-                          <TableCell>{sale.seller_username || '---'}</TableCell>
-                          <TableCell>R$ {formatCurrency(sale.total_value)}</TableCell>
-                          <TableCell><Chip label={sale.payment_method_label || (sale.is_paid ? "PAGO" : "FIADO")} color={sale.is_paid ? "success" : "warning"} size="small" variant="outlined" /></TableCell>
-                          <TableCell align="center">
-                            <IconButton size="small" color="error" title="Cancelar venda (devolve o estoque)" disabled={cancellingSaleId === sale.id} onClick={() => handleCancelSale(sale)}><Delete fontSize="small" /></IconButton>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
+              <Paper sx={{ p: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 2, flexWrap: 'wrap' }}>
+                <Box>
+                  <Typography variant="h6">Histórico de Vendas</Typography>
+                  <Typography variant="body2" color="text.secondary">
+                    Agora em aba própria, com busca e paginação.
+                  </Typography>
+                </Box>
+                <Button variant="outlined" startIcon={<ReceiptLong />} onClick={() => setTabValue('vendas')}>
+                  Abrir histórico
+                </Button>
               </Paper>
             </Grid>
           </Grid>
+        )}
+
+        {/* === ABA VENDAS (historico — somente admin) === */}
+        {tabValue === 'vendas' && isAdmin && (
+          <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
+            <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
+              <Typography variant="h5">Histórico de Vendas</Typography>
+              <Button size="small" startIcon={<Refresh />} onClick={() => fetchSalesPage()} disabled={loadingSales}>
+                Atualizar
+              </Button>
+            </Box>
+
+            <Paper sx={{ p: 2, mb: 2 }}>
+              <Grid container spacing={2} alignItems="center">
+                <Grid size={{ xs: 12, md: 5 }}>
+                  <TextField
+                    fullWidth size="small" label="Buscar cliente ou vendedor"
+                    placeholder="Funciona com ou sem acento"
+                    value={salesQuery}
+                    onChange={(e) => { setSalesQuery(e.target.value); setSalesPage(0); }}
+                    InputProps={{ startAdornment: <Search fontSize="small" sx={{ mr: 1, color: 'text.secondary' }} /> }}
+                  />
+                </Grid>
+                <Grid size={{ xs: 6, md: 3 }}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>Status</InputLabel>
+                    <Select label="Status" value={salesStatusFilter}
+                      onChange={(e) => { setSalesStatusFilter(e.target.value); setSalesPage(0); }}>
+                      <MenuItem value="">Todos</MenuItem>
+                      <MenuItem value="pago">Pagos</MenuItem>
+                      <MenuItem value="fiado">Fiado</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Grid>
+                <Grid size={{ xs: 6, md: 4 }}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>Pagamento</InputLabel>
+                    <Select label="Pagamento" value={salesMethodFilter}
+                      onChange={(e) => { setSalesMethodFilter(e.target.value); setSalesPage(0); }}>
+                      <MenuItem value="">Todas as formas</MenuItem>
+                      {paymentMethods.map((m) => (
+                        <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Grid>
+              </Grid>
+            </Paper>
+
+            <Paper>
+              {loadingSales && <LinearProgress />}
+              <TableContainer sx={{ maxHeight: isMobile ? 420 : 560 }}>
+                <Table stickyHeader size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Data</TableCell>
+                      <TableCell>Cliente</TableCell>
+                      {!isMobile && <TableCell>Vendedor</TableCell>}
+                      {!isMobile && <TableCell>Itens</TableCell>}
+                      <TableCell align="right">Valor</TableCell>
+                      <TableCell>Status</TableCell>
+                      <TableCell align="center">Ação</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {salesHistory.map((sale) => {
+                      const itens = (sale.items || []).map((it) => `${it.quantity}x ${it.product?.name || 'item'}`).join(', ');
+                      return (
+                        <TableRow key={sale.id} hover>
+                          <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatDateTimeBR(sale.created_at)}</TableCell>
+                          <TableCell>{sale.customer?.name || '---'}</TableCell>
+                          {!isMobile && <TableCell>{sale.seller_username || '---'}</TableCell>}
+                          {!isMobile && (
+                            <TableCell sx={{ maxWidth: 260 }}>
+                              <Tooltip title={itens || ''}>
+                                <Typography variant="body2" noWrap>{itens || '—'}</Typography>
+                              </Tooltip>
+                            </TableCell>
+                          )}
+                          <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>R$ {formatCurrency(sale.total_value)}</TableCell>
+                          <TableCell>
+                            <Chip
+                              label={sale.payment_method_label || (sale.is_paid ? 'PAGO' : 'FIADO')}
+                              color={sale.is_paid ? 'success' : 'warning'}
+                              size="small" variant="outlined"
+                            />
+                          </TableCell>
+                          <TableCell align="center">
+                            <IconButton size="small" color="error" title="Cancelar venda (devolve o estoque)"
+                              disabled={cancellingSaleId === sale.id}
+                              onClick={() => handleCancelSale(sale)}>
+                              <Delete fontSize="small" />
+                            </IconButton>
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                    {!loadingSales && salesHistory.length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={isMobile ? 5 : 7} align="center" sx={{ py: 4, color: 'text.secondary' }}>
+                          Nenhuma venda encontrada com esses filtros.
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <TablePagination
+                component="div"
+                count={salesTotal}
+                page={salesPage}
+                onPageChange={(e, novaPagina) => setSalesPage(novaPagina)}
+                rowsPerPage={salesPerPage}
+                onRowsPerPageChange={(e) => { setSalesPerPage(parseInt(e.target.value, 10)); setSalesPage(0); }}
+                rowsPerPageOptions={[25, 50, 100]}
+                labelRowsPerPage="Por página"
+                labelDisplayedRows={({ from, to, count }) => `${from}-${to} de ${count}`}
+              />
+            </Paper>
+          </Container>
         )}
 
         {/* === ABA ATIVIDADE (auditoria — somente admin) === */}
@@ -2274,6 +2425,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <BottomNavigationAction label="Consulta" value="consulta" icon={<ManageSearch />} />
             <BottomNavigationAction label="Clientes" value="clientes" icon={<People />} />
             <BottomNavigationAction label="Estoque" value="estoque" icon={<Inventory />} />
+            {isAdmin && <BottomNavigationAction label="Vendas" value="vendas" icon={<ReceiptLong />} />}
             {isAdmin && <BottomNavigationAction label="Usuários" value="usuarios" icon={<AdminPanelSettings />} />}
             {isAdmin && <BottomNavigationAction label="Atividade" value="atividade" icon={<Storage />} />}
           </BottomNavigation>
