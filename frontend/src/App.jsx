@@ -1782,19 +1782,6 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Grid>
             )}
 
-            <Grid size={12}>
-              <Paper sx={{ p: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 2, flexWrap: 'wrap' }}>
-                <Box>
-                  <Typography variant="h6">Histórico de Vendas</Typography>
-                  <Typography variant="body2" color="text.secondary">
-                    Agora em aba própria, com busca e paginação.
-                  </Typography>
-                </Box>
-                <Button variant="outlined" startIcon={<ReceiptLong />} onClick={() => setTabValue('vendas')}>
-                  Abrir histórico
-                </Button>
-              </Paper>
-            </Grid>
           </Grid>
         )}
 
