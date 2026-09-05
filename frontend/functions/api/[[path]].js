@@ -346,7 +346,8 @@ async function getSaleItems(db, saleId) {
 async function getSaleItemsBulk(db, saleIds) {
   const map = new Map();
   if (!saleIds.length) return map;
-  const CHUNK = 200;
+  // O D1 aceita no maximo 100 parametros por consulta
+  const CHUNK = 90;
   for (let i = 0; i < saleIds.length; i += CHUNK) {
     const chunk = saleIds.slice(i, i + CHUNK);
     const placeholders = chunk.map(() => '?').join(',');
