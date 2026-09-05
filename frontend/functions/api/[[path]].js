@@ -368,6 +368,26 @@ async function getSaleItemsBulk(db, saleIds) {
   return map;
 }
 
+// Todos os itens de uma vez, sem nenhum parametro na consulta.
+// O resumo usa esta versao porque agrega o evento inteiro: assim nao existe
+// risco de esbarrar no teto de parametros do D1, por maior que fique a base.
+async function getAllSaleItems(db) {
+  const rows = await all(db, `
+    SELECT si.*, p.name AS product_name, p.category AS product_category,
+           p.barcode AS product_barcode
+    FROM sale_items si
+    LEFT JOIN products p ON p.id = si.product_id
+    ORDER BY si.sale_id, si.id
+  `);
+  const map = new Map();
+  for (const row of rows) {
+    const list = map.get(row.sale_id) || [];
+    list.push(serializeSaleItem(row));
+    map.set(row.sale_id, list);
+  }
+  return map;
+}
+
 async function getCurrentUser(request, env, db) {
   const auth = request.headers.get('authorization') || '';
   const match = auth.match(/^Bearer\s+(.+)$/i);
@@ -1165,7 +1185,7 @@ async function salesSummary(request, db) {
   let debtTotal = 0;
   const sales = [];
 
-  const itemsBySale = await getSaleItemsBulk(db, rows.map((r) => r.id));
+  const itemsBySale = await getAllSaleItems(db);
 
   for (const row of rows) {
     const items = itemsBySale.get(row.id) || [];
