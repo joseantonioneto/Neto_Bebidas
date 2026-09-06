@@ -1103,6 +1103,29 @@ async function listSales(db, opts = {}) {
   return limit ? { items, total, limit, offset } : items;
 }
 
+// Extrato do cliente: saldo atual (fresco, nao o da lista em cache), compras e
+// baixas. E o que o modal usa para mostrar a conta fechada na hora da cobranca.
+async function customerStatement(db, customerId) {
+  const row = await first(db, 'SELECT * FROM customers WHERE id = ?', customerId);
+  if (!row) throw new HttpError(404, 'Cliente nao encontrado');
+  const sales = await listCustomerSales(db, customerId);
+  const pays = await all(db, `
+    SELECT id, amount, username, note, created_at FROM payments
+    WHERE customer_id = ? ORDER BY datetime(created_at) DESC, id DESC
+  `, customerId);
+  const payments = pays.map((p) => ({
+    id: p.id, amount: numberValue(p.amount), username: p.username, note: p.note, created_at: p.created_at
+  }));
+  const fiadoTotal = sales.filter((s) => !s.is_paid).reduce((acc, s) => acc + numberValue(s.total_value), 0);
+  const paidTotal = payments.reduce((acc, p) => acc + p.amount, 0);
+  return {
+    customer: serializeCustomer(row),
+    sales,
+    payments,
+    totals: { fiado: fiadoTotal, paid: paidTotal, debt: numberValue(row.debt) }
+  };
+}
+
 async function listCustomerSales(db, customerId) {
   const rows = await all(db, `
     SELECT s.*, c.name AS customer_name, c.phone AS customer_phone,
@@ -1521,6 +1544,10 @@ async function handle(request, env, params, ctx = {}) {
     if (second && third === 'sales' && request.method === 'GET') {
       requireSellerOrAdmin(currentUser);
       return json(await listCustomerSales(db, intValue(second)));
+    }
+    if (second && third === 'extrato' && request.method === 'GET') {
+      requireSellerOrAdmin(currentUser);
+      return json(await customerStatement(db, intValue(second)));
     }
     if (second && request.method === 'PUT') {
       requireSellerOrAdmin(currentUser);

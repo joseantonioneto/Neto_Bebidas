@@ -457,7 +457,7 @@ function App() {
   const [clientSort, setClientSort] = useState('nome'); // 'nome' | 'grupo' | 'divida'
   const [clientGroupFilter, setClientGroupFilter] = useState('');   // '' = todos, '__sem__' = sem grupo
   const [clientDebtFilter, setClientDebtFilter] = useState('todos'); // 'todos' | 'fiado' | 'quitados'
-  const [customerDialog, setCustomerDialog] = useState({ open: false, id: null, name: '', phone: '', group_name: '', debt: 0, sales: [], loadingSales: false });
+  const [customerDialog, setCustomerDialog] = useState({ open: false, id: null, name: '', phone: '', group_name: '', debt: 0, sales: [], payments: [], totals: null, loadingSales: false });
   const [activityLogs, setActivityLogs] = useState([]);
   const [logsLoading, setLogsLoading] = useState(false);
   const [logUserFilter, setLogUserFilter] = useState('');
@@ -1172,10 +1172,19 @@ function App() {
 
   // Abre o modal do cliente (editar + histórico de compras)
   const openCustomerDialog = async (row) => {
-    setCustomerDialog({ open: true, id: row.id, name: row.name, phone: row.phone || '', group_name: row.group_name || '', debt: row.debt, sales: [], loadingSales: true });
+    setCustomerDialog({ open: true, id: row.id, name: row.name, phone: row.phone || '', group_name: row.group_name || '', debt: row.debt, sales: [], payments: [], totals: null, loadingSales: true });
     try {
-      const { data } = await api.get(`/customers/${row.id}/sales`);
-      setCustomerDialog(prev => (prev.id === row.id ? { ...prev, sales: data, loadingSales: false } : prev));
+      // O extrato traz o saldo direto do servidor: a lista em memoria pode
+      // estar atrasada se outro vendedor acabou de lancar algo.
+      const { data } = await api.get(`/customers/${row.id}/extrato`);
+      setCustomerDialog(prev => (prev.id === row.id ? {
+        ...prev,
+        debt: data.customer?.debt ?? prev.debt,
+        sales: data.sales || [],
+        payments: data.payments || [],
+        totals: data.totals || null,
+        loadingSales: false
+      } : prev));
     } catch {
       setCustomerDialog(prev => (prev.id === row.id ? { ...prev, loadingSales: false } : prev));
     }
@@ -2725,6 +2734,42 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           </Box>
 
           <Divider sx={{ my: 2 }} />
+
+          {/* A conta fechada: e isso que a vendedora precisa ver na hora de cobrar */}
+          {customerDialog.totals && (
+            <Paper variant="outlined" sx={{ p: 1.5, mb: 2, bgcolor: '#fffdf5' }}>
+              <Box display="flex" justifyContent="space-between"><Typography variant="body2">Comprou fiado</Typography><Typography variant="body2">R$ {formatCurrency(customerDialog.totals.fiado)}</Typography></Box>
+              <Box display="flex" justifyContent="space-between"><Typography variant="body2" color="success.main">Já pagou</Typography><Typography variant="body2" color="success.main">− R$ {formatCurrency(customerDialog.totals.paid)}</Typography></Box>
+              <Divider sx={{ my: 0.75 }} />
+              <Box display="flex" justifyContent="space-between"><Typography variant="body2" fontWeight="bold">Deve</Typography><Typography variant="body2" fontWeight="bold" color={customerDialog.totals.debt > 0 ? 'error.main' : 'success.main'}>R$ {formatCurrency(customerDialog.totals.debt)}</Typography></Box>
+              {customerDialog.totals.debt > 0 && (
+                <Button size="small" variant="contained" color="success" fullWidth sx={{ mt: 1 }}
+                  onClick={() => { payRequestIdRef.current = newRequestId(); setPayData({ customerId: customerDialog.id, customerName: customerDialog.name, amount: '', debt: customerDialog.totals.debt }); setOpenPayDialog(true); }}>
+                  Receber pagamento
+                </Button>
+              )}
+            </Paper>
+          )}
+
+          {(customerDialog.payments || []).length > 0 && (
+            <>
+              <Typography variant="subtitle2" gutterBottom>Baixas ({customerDialog.payments.length})</Typography>
+              <List dense sx={{ maxHeight: 150, overflowY: 'auto', bgcolor: '#f3faf3', borderRadius: 1, p: 0, mb: 2 }}>
+                {customerDialog.payments.map((pg) => (
+                  <ListItem key={pg.id} sx={{ display: 'block', borderBottom: '1px solid #e0eee0', py: 0.75 }}>
+                    <Box display="flex" justifyContent="space-between" alignItems="center" gap={1}>
+                      <Typography variant="body2" fontWeight="bold" color="success.main">− R$ {formatCurrency(pg.amount)}</Typography>
+                      {pg.note && pg.note.startsWith('Valor inferido') && <Chip size="small" label="valor inferido" variant="outlined" />}
+                    </Box>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      {formatDateTimeBR(pg.created_at)}{pg.username ? ` · ${pg.username}` : ''}
+                    </Typography>
+                  </ListItem>
+                ))}
+              </List>
+            </>
+          )}
+
           <Typography variant="subtitle2" gutterBottom>Compras {customerDialog.loadingSales ? '(carregando...)' : `(${customerDialog.sales.length})`}</Typography>
           {customerDialog.loadingSales && <LinearProgress />}
           {!customerDialog.loadingSales && customerDialog.sales.length === 0 && (
