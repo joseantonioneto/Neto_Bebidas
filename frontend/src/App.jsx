@@ -454,7 +454,9 @@ function App() {
   const [newClientName, setNewClientName] = useState('');
   const [newClientPhone, setNewClientPhone] = useState('');
   const [newClientGroup, setNewClientGroup] = useState('Caminhar Cristo Rei');
-  const [clientSort, setClientSort] = useState('nome'); // 'nome' | 'grupo'
+  const [clientSort, setClientSort] = useState('nome'); // 'nome' | 'grupo' | 'divida'
+  const [clientGroupFilter, setClientGroupFilter] = useState('');   // '' = todos, '__sem__' = sem grupo
+  const [clientDebtFilter, setClientDebtFilter] = useState('todos'); // 'todos' | 'fiado' | 'quitados'
   const [customerDialog, setCustomerDialog] = useState({ open: false, id: null, name: '', phone: '', group_name: '', debt: 0, sales: [], loadingSales: false });
   const [activityLogs, setActivityLogs] = useState([]);
   const [logsLoading, setLogsLoading] = useState(false);
@@ -887,15 +889,39 @@ function App() {
 
   const filteredCustomers = customers
     .filter(c => normalizeText(c.name).includes(normalizeText(searchTerm)))
-    .sort((a, b) => clientSort === 'grupo'
-      ? (a.group_name || 'zzz').localeCompare(b.group_name || 'zzz') || a.name.localeCompare(b.name)
-      : a.name.localeCompare(b.name));
+    .filter(c => !clientGroupFilter
+      || (clientGroupFilter === '__sem__' ? !c.group_name : c.group_name === clientGroupFilter))
+    .filter(c => clientDebtFilter === 'todos'
+      || (clientDebtFilter === 'fiado' ? c.debt > 0 : c.debt <= 0))
+    .sort((a, b) => {
+      if (clientSort === 'divida') return b.debt - a.debt || a.name.localeCompare(b.name);
+      if (clientSort === 'grupo') return (a.group_name || 'zzz').localeCompare(b.group_name || 'zzz') || a.name.localeCompare(b.name);
+      return a.name.localeCompare(b.name);
+    });
+
+  // Quanto a lista filtrada tem a receber — serve de meta na hora da cobranca
+  const filteredDebtTotal = filteredCustomers.reduce((acc, c) => acc + Math.max(0, c.debt), 0);
+  const filteredDebtCount = filteredCustomers.filter(c => c.debt > 0).length;
 
   // Grupos existentes (únicos) para cadastro rápido por clique
   const customerGroups = useMemo(() => {
     const set = new Set();
     customers.forEach(c => { if (c.group_name) set.add(c.group_name); });
     return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [customers]);
+
+  // Resumo por grupo, para o seletor mostrar onde tem fiado em aberto
+  const groupDebtSummary = useMemo(() => {
+    const mapa = {};
+    customers.forEach(c => {
+      const chave = c.group_name || '__sem__';
+      mapa[chave] ||= { comFiado: 0, total: 0 };
+      if (c.debt > 0) {
+        mapa[chave].comFiado += 1;
+        mapa[chave].total += c.debt;
+      }
+    });
+    return mapa;
   }, [customers]);
   const filteredProducts = products.filter(p => {
     const term = normalizeText(searchTermProduct);
@@ -2360,12 +2386,61 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             </Box>
             <Paper sx={{ p: 2, mb: 2 }}>
               <TextField fullWidth variant="standard" placeholder="Pesquisar..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} InputProps={{ startAdornment: <Search sx={{ mr: 1, color: 'action.active' }} /> }} />
-              <Box display="flex" alignItems="center" gap={1} mt={1.5}>
+
+              <Grid container spacing={2} sx={{ mt: 0.5 }}>
+                <Grid size={{ xs: 12, md: 6 }}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>Grupo</InputLabel>
+                    <Select label="Grupo" value={clientGroupFilter} onChange={(e) => setClientGroupFilter(e.target.value)}>
+                      <MenuItem value="">Todos os grupos</MenuItem>
+                      {customerGroups.map((g) => {
+                        const resumo = groupDebtSummary[g];
+                        return (
+                          <MenuItem key={g} value={g}>
+                            {g}{resumo?.comFiado ? ` — ${resumo.comFiado} com fiado (R$ ${formatCurrency(resumo.total)})` : ''}
+                          </MenuItem>
+                        );
+                      })}
+                      <MenuItem value="__sem__">Sem grupo</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Grid>
+                <Grid size={{ xs: 12, md: 6 }}>
+                  <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" sx={{ height: '100%' }}>
+                    <Typography variant="caption" color="text.secondary">Mostrar:</Typography>
+                    <Chip label="Todos" size="small" color={clientDebtFilter === 'todos' ? 'primary' : 'default'} onClick={() => setClientDebtFilter('todos')} />
+                    <Chip label="Só com fiado" size="small" color={clientDebtFilter === 'fiado' ? 'warning' : 'default'} onClick={() => setClientDebtFilter('fiado')} />
+                    <Chip label="Quitados" size="small" color={clientDebtFilter === 'quitados' ? 'success' : 'default'} onClick={() => setClientDebtFilter('quitados')} />
+                  </Box>
+                </Grid>
+              </Grid>
+
+              <Box display="flex" alignItems="center" gap={1} mt={1.5} flexWrap="wrap">
                 <Typography variant="caption" color="text.secondary">Ordenar por:</Typography>
                 <Chip label="Nome" size="small" color={clientSort === 'nome' ? 'primary' : 'default'} onClick={() => setClientSort('nome')} />
                 <Chip label="Grupo" size="small" color={clientSort === 'grupo' ? 'primary' : 'default'} onClick={() => setClientSort('grupo')} />
+                <Chip label="Maior dívida" size="small" color={clientSort === 'divida' ? 'primary' : 'default'} onClick={() => setClientSort('divida')} />
+                {(clientGroupFilter || clientDebtFilter !== 'todos' || searchTerm) && (
+                  <Button size="small" onClick={() => { setClientGroupFilter(''); setClientDebtFilter('todos'); setSearchTerm(''); }}>
+                    Limpar filtros
+                  </Button>
+                )}
               </Box>
             </Paper>
+
+            {filteredDebtCount > 0 && (
+              <Paper sx={{ p: 2, mb: 2, borderLeft: '5px solid #ff9800' }}>
+                <Typography variant="caption" color="text.secondary">
+                  A receber{clientGroupFilter && clientGroupFilter !== '__sem__' ? ` — ${clientGroupFilter}` : ''}
+                </Typography>
+                <Typography variant={isMobile ? 'h6' : 'h5'} fontWeight="bold" color="warning.main">
+                  R$ {formatCurrency(filteredDebtTotal)}
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  {filteredDebtCount} {filteredDebtCount === 1 ? 'pessoa com fiado' : 'pessoas com fiado'}
+                </Typography>
+              </Paper>
+            )}
             <TableContainer component={Paper}>
               <Table size={isMobile ? "small" : "medium"}>
                 <TableHead sx={{ bgcolor: '#eee' }}>
@@ -2398,7 +2473,8 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               </Table>
             </TableContainer>
             <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-              {filteredCustomers.length} clientes
+              {filteredCustomers.length} {filteredCustomers.length === 1 ? 'cliente' : 'clientes'}
+              {filteredCustomers.length !== customers.length && ` (de ${customers.length})`}
             </Typography>
           </Container>
         )}
