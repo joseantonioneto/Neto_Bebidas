@@ -910,11 +910,13 @@ async function payDebt(request, db, id, user) {
   }
 
   const novaDivida = Math.max(0, debt - amount);
-  await run(db, 'UPDATE customers SET debt = ? WHERE id = ?', novaDivida, id);
-  await run(db, `
-    INSERT INTO payments (customer_id, amount, username, note, client_request_id, created_at)
-    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-  `, id, amount, user?.username || null, data.note || null, clientRequestId);
+  await db.batch([
+    db.prepare('UPDATE customers SET debt = ? WHERE id = ?').bind(novaDivida, id),
+    db.prepare(`
+      INSERT INTO payments (customer_id, amount, username, note, client_request_id, created_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(id, amount, user?.username || null, data.note || null, clientRequestId)
+  ]);
 
   return { message: 'Pago', debt: novaDivida, amount };
 }
@@ -958,8 +960,11 @@ async function listPayments(db, opts = {}) {
 async function cancelPayment(db, id) {
   const pagamento = await first(db, 'SELECT * FROM payments WHERE id = ?', id);
   if (!pagamento) throw new HttpError(404, 'Baixa nao encontrada');
-  await run(db, 'UPDATE customers SET debt = debt + ? WHERE id = ?', numberValue(pagamento.amount), pagamento.customer_id);
-  await run(db, 'DELETE FROM payments WHERE id = ?', id);
+  await db.batch([
+    db.prepare('UPDATE customers SET debt = debt + ? WHERE id = ?')
+      .bind(numberValue(pagamento.amount), pagamento.customer_id),
+    db.prepare('DELETE FROM payments WHERE id = ?').bind(id)
+  ]);
   return { message: 'Baixa estornada', amount: numberValue(pagamento.amount) };
 }
 
@@ -1116,15 +1121,34 @@ async function cancelSale(db, id) {
   const sale = await first(db, 'SELECT * FROM sales WHERE id = ?', id);
   if (!sale) throw new HttpError(404, 'Venda nao encontrada');
   const items = await all(db, 'SELECT * FROM sale_items WHERE sale_id = ?', id);
-  for (const item of items) {
-    await run(db, 'UPDATE products SET stock = stock + ? WHERE id = ?', intValue(item.quantity), item.product_id);
-  }
+
+  const comandos = items.map((item) =>
+    db.prepare('UPDATE products SET stock = stock + ? WHERE id = ?')
+      .bind(intValue(item.quantity), item.product_id));
+
+  // Se a venda era fiado e o cliente ja tinha quitado, o MAX(0, ...) engolia a
+  // diferenca em silencio. Agora esse saldo a devolver volta na resposta.
+  let creditoAoCliente = 0;
   if (!sale.is_paid && sale.customer_id) {
-    await run(db, 'UPDATE customers SET debt = MAX(0, debt - ?) WHERE id = ?', numberValue(sale.total_value), sale.customer_id);
+    const cliente = await first(db, 'SELECT debt FROM customers WHERE id = ?', sale.customer_id);
+    const dividaAtual = numberValue(cliente?.debt);
+    const valor = numberValue(sale.total_value);
+    if (valor > dividaAtual) creditoAoCliente = Number((valor - dividaAtual).toFixed(2));
+    comandos.push(db.prepare('UPDATE customers SET debt = MAX(0, debt - ?) WHERE id = ?')
+      .bind(valor, sale.customer_id));
   }
-  await run(db, 'DELETE FROM sale_items WHERE sale_id = ?', id);
-  await run(db, 'DELETE FROM sales WHERE id = ?', id);
-  return { message: 'Venda cancelada e estoque restaurado', restored_items: items.length };
+
+  comandos.push(db.prepare('DELETE FROM sale_items WHERE sale_id = ?').bind(id));
+  comandos.push(db.prepare('DELETE FROM sales WHERE id = ?').bind(id));
+  await db.batch(comandos);
+
+  return {
+    message: creditoAoCliente > 0
+      ? `Venda cancelada. Atencao: o cliente ja tinha pago, devolver R$ ${creditoAoCliente.toFixed(2)}.`
+      : 'Venda cancelada e estoque restaurado',
+    restored_items: items.length,
+    credit_to_customer: creditoAoCliente
+  };
 }
 
 async function createSale(request, db, user) {
@@ -1172,7 +1196,6 @@ async function createSale(request, db, user) {
     const product = await first(db, 'SELECT * FROM products WHERE id = ?', productId);
     if (!product) throw new HttpError(404, `Produto ${productId} nao encontrado`);
     if (intValue(product.stock) < qty) throw new HttpError(400, `Sem estoque: ${product.name}`);
-    await run(db, 'UPDATE products SET stock = stock - ? WHERE id = ?', qty, productId);
     total += numberValue(product.sell_price) * qty;
     saleItems.push({
       product_id: productId,
@@ -1182,34 +1205,57 @@ async function createSale(request, db, user) {
     });
   }
 
-  const result = await run(db, `
-    INSERT INTO sales (
-      customer_id, seller_username, total_value, is_paid, payment_method,
-      payment_status, payment_provider, payment_reference, event_day,
-      client_request_id, created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-  `,
-  customer.id,
-  user.username,
-  total,
-  isPaid ? 1 : 0,
-  paymentMethod,
-  isPaid ? 'paid' : 'pending',
-  data.payment_provider || null,
-  data.payment_reference || null,
-  eventDay,
-  clientRequestId);
+  // Tudo numa transacao so. Antes, a venda, a baixa do estoque e a soma da
+  // divida eram gravadas em comandos separados: se a requisicao morresse no
+  // meio, a venda ficava registrada sem entrar na divida do cliente.
+  const proximo = await first(db, 'SELECT COALESCE(MAX(id), 0) + 1 AS proximoId FROM sales');
+  const saleId = intValue(proximo?.proximoId) || 1;
 
-  const saleId = lastRowId(result);
+  const comandos = [
+    db.prepare(`
+      INSERT INTO sales (
+        id, customer_id, seller_username, total_value, is_paid, payment_method,
+        payment_status, payment_provider, payment_reference, event_day,
+        client_request_id, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(
+      saleId,
+      customer.id,
+      user.username,
+      total,
+      isPaid ? 1 : 0,
+      paymentMethod,
+      isPaid ? 'paid' : 'pending',
+      data.payment_provider || null,
+      data.payment_reference || null,
+      eventDay,
+      clientRequestId
+    )
+  ];
+
   for (const item of saleItems) {
-    await run(db, `
+    comandos.push(db.prepare(`
       INSERT INTO sale_items (sale_id, product_id, quantity, unit_sell_price, unit_cost_price)
       VALUES (?, ?, ?, ?, ?)
-    `, saleId, item.product_id, item.quantity, item.unit_sell_price, item.unit_cost_price);
+    `).bind(saleId, item.product_id, item.quantity, item.unit_sell_price, item.unit_cost_price));
+    comandos.push(db.prepare('UPDATE products SET stock = stock - ? WHERE id = ?')
+      .bind(item.quantity, item.product_id));
   }
 
-  if (!isPaid) await run(db, 'UPDATE customers SET debt = debt + ? WHERE id = ?', total, customer.id);
+  if (!isPaid) {
+    comandos.push(db.prepare('UPDATE customers SET debt = debt + ? WHERE id = ?')
+      .bind(total, customer.id));
+  }
+
+  try {
+    await db.batch(comandos);
+  } catch (err) {
+    // Duas vendas simultaneas podem disputar o mesmo id: falha inteira, sem
+    // gravar nada pela metade. O vendedor so precisa repetir.
+    throw new HttpError(409, 'Nao foi possivel concluir a venda. Tente novamente.');
+  }
+
   return { message: 'Venda realizada', sale: await getSale(db, saleId) };
 }
 
