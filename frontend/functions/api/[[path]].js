@@ -1638,7 +1638,7 @@ async function supplierSales(db, opts = {}) {
   }
 
   const rows = await all(db, `
-    SELECT si.quantity, si.unit_sell_price, si.product_id, p.name AS product_name,
+    SELECT si.quantity, si.unit_sell_price, si.unit_cost_price, si.product_id, p.name AS product_name,
            s.id AS sale_id, s.created_at, s.seller_username, c.name AS customer_name
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
@@ -1662,9 +1662,13 @@ async function supplierSales(db, opts = {}) {
       unmatchedCount += 1;
       continue;
     }
-    bySupplier[supplier] ||= { supplier, quantity: 0, revenue: 0, sales_count: 0, items: [] };
+    bySupplier[supplier] ||= {
+      supplier, quantity: 0, revenue: 0, cost: 0, sales_count: 0,
+      products_count: 0, stock: 0, items: []
+    };
     bySupplier[supplier].quantity += row.quantity;
     bySupplier[supplier].revenue += total;
+    bySupplier[supplier].cost += row.quantity * numberValue(row.unit_cost_price);
     bySupplier[supplier].sales_count += 1;
     bySupplier[supplier].items.push({
       sale_id: row.sale_id,
@@ -1678,8 +1682,36 @@ async function supplierSales(db, opts = {}) {
     });
   }
 
+  // Estoque atual por fornecedor. Nao existe log confiavel de entrada de
+  // mercadoria, entao a entrada e deduzida: o que ainda esta em estoque mais
+  // o que ja foi vendido. Ajuste manual de estoque distorce essa conta.
+  const produtos = await all(db, 'SELECT id, name, stock FROM products');
+  let unmatchedStock = 0;
+  let unmatchedProducts = 0;
+  for (const prod of produtos) {
+    const supplier = extractSupplier(prod.name);
+    if (!supplier) {
+      unmatchedStock += intValue(prod.stock);
+      unmatchedProducts += 1;
+      continue;
+    }
+    bySupplier[supplier] ||= {
+      supplier, quantity: 0, revenue: 0, cost: 0, sales_count: 0,
+      products_count: 0, stock: 0, items: []
+    };
+    bySupplier[supplier].products_count += 1;
+    bySupplier[supplier].stock += intValue(prod.stock);
+  }
+
   const suppliers = Object.values(bySupplier)
-    .map((s) => ({ ...s, revenue: Number(s.revenue.toFixed(2)) }))
+    .map((s) => ({
+      ...s,
+      revenue: Number(s.revenue.toFixed(2)),
+      cost: Number(s.cost.toFixed(2)),
+      profit: Number((s.revenue - s.cost).toFixed(2)),
+      // entrada estimada = ainda em estoque + ja vendido
+      entrada: s.stock + s.quantity
+    }))
     .sort((a, b) => b.revenue - a.revenue);
 
   return {
@@ -1688,7 +1720,10 @@ async function supplierSales(db, opts = {}) {
     unmatched: {
       quantity: unmatchedQty,
       revenue: Number(unmatchedRevenue.toFixed(2)),
-      sales_count: unmatchedCount
+      sales_count: unmatchedCount,
+      products_count: unmatchedProducts,
+      stock: unmatchedStock,
+      entrada: unmatchedStock + unmatchedQty
     }
   };
 }

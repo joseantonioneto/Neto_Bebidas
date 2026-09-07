@@ -2513,32 +2513,50 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
               <Typography variant="h6" gutterBottom>Vendas por fornecedor</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
                 Extraído do nome do produto ("Descrição - Fornecedor"). Clique numa linha para ver os itens vendidos.
+                A <strong>entrada</strong> é deduzida (estoque atual + vendido) — não existe log de entrada de mercadoria,
+                então ajuste manual de estoque distorce esse número.
               </Typography>
               {loadingSuppliers && <LinearProgress sx={{ mb: 1.5 }} />}
               {!loadingSuppliers && (!supplierReport || supplierReport.suppliers.length === 0) && (
                 <Typography variant="body2" color="text.secondary">Nenhuma venda com fornecedor identificado no período.</Typography>
               )}
               {!loadingSuppliers && supplierReport && supplierReport.suppliers.length > 0 && (
-                <TableContainer sx={{ maxHeight: 400 }}>
+                <TableContainer sx={{ maxHeight: 460 }}>
                   <Table size="small" stickyHeader>
                     <TableHead>
                       <TableRow>
                         <TableCell>Fornecedor</TableCell>
-                        <TableCell align="center">Vendas</TableCell>
-                        <TableCell align="center">Unidades</TableCell>
-                        <TableCell align="right">Total</TableCell>
+                        {!isMobile && <TableCell align="center">Produtos</TableCell>}
+                        <TableCell align="center">Entrada</TableCell>
+                        <TableCell align="center">Vendido</TableCell>
+                        <TableCell align="center">Estoque</TableCell>
+                        <TableCell align="right">Faturamento</TableCell>
+                        {!isMobile && <TableCell align="right">Lucro</TableCell>}
                       </TableRow>
                     </TableHead>
                     <TableBody>
-                      {supplierReport.suppliers.map((row) => (
-                        <TableRow key={row.supplier} hover sx={{ cursor: 'pointer' }}
-                          onClick={() => setSupplierModal({ open: true, supplier: row })}>
-                          <TableCell sx={{ color: 'primary.main', fontWeight: 'bold' }}>{row.supplier}</TableCell>
-                          <TableCell align="center">{row.sales_count}</TableCell>
-                          <TableCell align="center">{row.quantity}</TableCell>
-                          <TableCell align="right">R$ {formatCurrency(row.revenue)}</TableCell>
-                        </TableRow>
-                      ))}
+                      {supplierReport.suppliers.map((row) => {
+                        const pct = row.entrada ? Math.round((row.quantity / row.entrada) * 100) : 0;
+                        return (
+                          <TableRow key={row.supplier} hover sx={{ cursor: 'pointer' }}
+                            onClick={() => setSupplierModal({ open: true, supplier: row })}>
+                            <TableCell sx={{ color: 'primary.main', fontWeight: 'bold' }}>{row.supplier}</TableCell>
+                            {!isMobile && <TableCell align="center">{row.products_count}</TableCell>}
+                            <TableCell align="center">{row.entrada}</TableCell>
+                            <TableCell align="center">
+                              {row.quantity}
+                              <Typography variant="caption" color="text.secondary" display="block">{pct}%</Typography>
+                            </TableCell>
+                            <TableCell align="center">{row.stock}</TableCell>
+                            <TableCell align="right">R$ {formatCurrency(row.revenue)}</TableCell>
+                            {!isMobile && (
+                              <TableCell align="right" sx={{ color: row.profit >= 0 ? 'success.main' : 'error.main' }}>
+                                R$ {formatCurrency(row.profit)}
+                              </TableCell>
+                            )}
+                          </TableRow>
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </TableContainer>
@@ -3354,9 +3372,17 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         </DialogTitle>
         <DialogContent sx={{ pt: 1 }}>
           {supplierModal.supplier && (
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-              {supplierModal.supplier.sales_count} vendas · {supplierModal.supplier.quantity} unidades
-            </Typography>
+            <Box sx={{ mb: 1.5 }}>
+              <Typography variant="body2" color="text.secondary">
+                {supplierModal.supplier.products_count} produtos · {supplierModal.supplier.sales_count} vendas
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Entrada {supplierModal.supplier.entrada} un. · vendido {supplierModal.supplier.quantity} un. · em estoque {supplierModal.supplier.stock} un.
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Custo R$ {formatCurrency(supplierModal.supplier.cost)} · lucro R$ {formatCurrency(supplierModal.supplier.profit)}
+              </Typography>
+            </Box>
           )}
           <List dense sx={{ maxHeight: 420, overflowY: 'auto', bgcolor: '#fafafa', borderRadius: 1, p: 0 }}>
             {(supplierModal.supplier?.items || []).map((it, idx) => (
