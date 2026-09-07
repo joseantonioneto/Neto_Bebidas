@@ -9,7 +9,7 @@ import {
   DialogContent, DialogActions, Badge, Chip, Autocomplete,
   BottomNavigation, BottomNavigationAction, Fab, Drawer,
   useMediaQuery, useTheme, Divider, LinearProgress, Switch,
-  FormControlLabel, CircularProgress, TablePagination, Tooltip
+  FormControlLabel, CircularProgress, TablePagination, Tooltip, TableSortLabel
 } from '@mui/material';
 
 import {
@@ -430,6 +430,9 @@ function App() {
   const [reportEndDate, setReportEndDate] = useState('');
   const [reportCategory, setReportCategory] = useState('');
   const [reportProduct, setReportProduct] = useState(null);
+  // Tabela "Vendas por Produto" — busca e ordenacao proprias, dentro dela
+  const [productReportSearch, setProductReportSearch] = useState('');
+  const [productReportSort, setProductReportSort] = useState({ field: 'total', dir: 'desc' });
   const [dashboard, setDashboard] = useState(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [supplierReport, setSupplierReport] = useState(null);
@@ -613,10 +616,15 @@ function App() {
 
   // Resumo: consulta propria, para uma falha aqui nao derrubar o resto da tela.
   // O product_id vai junto porque o total por dia do grafico e somado no servidor.
-  const fetchSummary = useCallback(async (productId) => {
+  const fetchSummary = useCallback(async (opts = {}) => {
+    const productId = typeof opts === 'object' ? opts.productId : opts; // aceita chamada antiga (so o id)
     try {
       const { data } = await api.get('/reports/summary', {
-        params: productId ? { product_id: productId } : {}
+        params: {
+          product_id: productId || undefined,
+          start_date: opts?.startDate || undefined,
+          end_date: opts?.endDate || undefined
+        }
       });
       setReportSummary(data);
     } catch {
@@ -758,12 +766,13 @@ function App() {
     fetchSuppliers();
   }, [token, isAdmin, tabValue, fetchSuppliers]);
 
-  // Tambem carrega o resumo (traz a quantidade vendida por produto, usada na
-  // lista de "Produtos com custo zero")
+  // Tambem carrega o resumo (traz a venda por produto, usada na lista de
+  // "Produtos com custo zero" e na tabela "Vendas por Produto"); respeita
+  // o mesmo periodo escolhido nos filtros da aba.
   useEffect(() => {
     if (!token || !isAdmin || tabValue !== 'relatorio') return;
-    fetchSummary();
-  }, [token, isAdmin, tabValue, fetchSummary]);
+    fetchSummary({ startDate: reportStartDate, endDate: reportEndDate });
+  }, [token, isAdmin, tabValue, reportStartDate, reportEndDate, fetchSummary]);
 
   // Atualiza o estoque em tempo real enquanto a aba Consulta estiver aberta
   useEffect(() => {
@@ -972,6 +981,36 @@ function App() {
     (reportSummary?.top_products || []).forEach((tp) => { map[tp.product_id] = tp.quantity; });
     return map;
   }, [reportSummary]);
+
+  // Tabela "Vendas por Produto": aplica os mesmos filtros do topo da aba
+  // (categoria/produto/período, via reportSummary ja filtrado) mais a busca
+  // e a ordenação de coluna proprias da tabela.
+  const productReportRows = useMemo(() => {
+    let rows = (reportSummary?.top_products || []).map((tp) => ({
+      ...tp,
+      profit: Number((Number(tp.total || 0) - Number(tp.cost || 0)).toFixed(2))
+    }));
+    if (reportCategory) rows = rows.filter((r) => (r.category || 'Geral') === reportCategory);
+    if (reportProduct) rows = rows.filter((r) => r.product_id === reportProduct.id);
+    const term = normalizeText(productReportSearch);
+    if (term) rows = rows.filter((r) => normalizeText(r.name).includes(term));
+
+    const { field, dir } = productReportSort;
+    const mult = dir === 'asc' ? 1 : -1;
+    rows = [...rows].sort((a, b) => {
+      if (field === 'name' || field === 'category') {
+        return mult * String(a[field] || '').localeCompare(String(b[field] || ''));
+      }
+      return mult * ((a[field] || 0) - (b[field] || 0));
+    });
+    return rows;
+  }, [reportSummary, reportCategory, reportProduct, productReportSearch, productReportSort]);
+
+  const handleProductReportSort = (field) => {
+    setProductReportSort((prev) => prev.field === field
+      ? { field, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+      : { field, dir: field === 'name' || field === 'category' ? 'asc' : 'desc' });
+  };
 
   const filteredCustomers = customers
     .filter(c => normalizeText(c.name).includes(normalizeText(searchTerm)))
@@ -2216,7 +2255,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
             <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
               <Typography variant="h5">Relatório</Typography>
-              <Button size="small" startIcon={<Refresh />} onClick={() => { fetchDashboard(); fetchSuppliers(); }} disabled={loadingDashboard || loadingSuppliers}>
+              <Button size="small" startIcon={<Refresh />} onClick={() => { fetchDashboard(); fetchSuppliers(); fetchSummary({ startDate: reportStartDate, endDate: reportEndDate }); }} disabled={loadingDashboard || loadingSuppliers}>
                 Atualizar
               </Button>
             </Box>
@@ -2312,6 +2351,77 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                       <Bar dataKey="quantity" name="Unidades" fill="#00897b" radius={[4, 4, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
+                </Paper>
+
+                <Paper sx={{ p: 2, mb: 2 }}>
+                  <Box display="flex" justifyContent="space-between" alignItems="center" mb={1} gap={1} flexWrap="wrap">
+                    <Typography variant="h6">Vendas por produto</Typography>
+                    <TextField
+                      size="small" placeholder="Buscar produto..."
+                      value={productReportSearch} onChange={(e) => setProductReportSearch(e.target.value)}
+                      InputProps={{ startAdornment: <Search fontSize="small" sx={{ mr: 1, color: 'text.secondary' }} /> }}
+                      sx={{ width: { xs: '100%', sm: 240 } }}
+                    />
+                  </Box>
+                  {productReportRows.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">Nenhuma venda encontrada com esses filtros.</Typography>
+                  ) : (
+                    <TableContainer sx={{ maxHeight: 420 }}>
+                      <Table size="small" stickyHeader>
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>
+                              <TableSortLabel active={productReportSort.field === 'name'} direction={productReportSort.field === 'name' ? productReportSort.dir : 'asc'} onClick={() => handleProductReportSort('name')}>
+                                Produto
+                              </TableSortLabel>
+                            </TableCell>
+                            {!isMobile && (
+                              <TableCell>
+                                <TableSortLabel active={productReportSort.field === 'category'} direction={productReportSort.field === 'category' ? productReportSort.dir : 'asc'} onClick={() => handleProductReportSort('category')}>
+                                  Categoria
+                                </TableSortLabel>
+                              </TableCell>
+                            )}
+                            <TableCell align="center">
+                              <TableSortLabel active={productReportSort.field === 'quantity'} direction={productReportSort.field === 'quantity' ? productReportSort.dir : 'desc'} onClick={() => handleProductReportSort('quantity')}>
+                                Qtd
+                              </TableSortLabel>
+                            </TableCell>
+                            <TableCell align="right">
+                              <TableSortLabel active={productReportSort.field === 'total'} direction={productReportSort.field === 'total' ? productReportSort.dir : 'desc'} onClick={() => handleProductReportSort('total')}>
+                                Faturamento
+                              </TableSortLabel>
+                            </TableCell>
+                            {!isMobile && (
+                              <TableCell align="right">
+                                <TableSortLabel active={productReportSort.field === 'profit'} direction={productReportSort.field === 'profit' ? productReportSort.dir : 'desc'} onClick={() => handleProductReportSort('profit')}>
+                                  Lucro
+                                </TableSortLabel>
+                              </TableCell>
+                            )}
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {productReportRows.map((row) => (
+                            <TableRow key={row.product_id} hover>
+                              <TableCell>{row.name}</TableCell>
+                              {!isMobile && <TableCell>{row.category || 'Geral'}</TableCell>}
+                              <TableCell align="center">{row.quantity}</TableCell>
+                              <TableCell align="right">R$ {formatCurrency(row.total)}</TableCell>
+                              {!isMobile && (
+                                <TableCell align="right" sx={{ color: row.profit >= 0 ? 'success.main' : 'error.main' }}>
+                                  R$ {formatCurrency(row.profit)}
+                                </TableCell>
+                              )}
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  )}
+                  <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                    {productReportRows.length} produtos
+                  </Typography>
                 </Paper>
 
                 <Paper sx={{ p: 2, mb: 2 }}>
