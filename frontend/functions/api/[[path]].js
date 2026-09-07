@@ -304,6 +304,8 @@ function serializeSale(row, items = []) {
     event_day: row.event_day || 'Dia 1',
     sale_date: saleDate(row.created_at),
     created_at: normalizeDateTime(row.created_at),
+    cancelled_at: row.cancelled_at ? normalizeDateTime(row.cancelled_at) : null,
+    cancelled_by: row.cancelled_by || null,
     customer: row.customer_name ? serializeCustomer({
       id: row.customer_id,
       name: row.customer_name,
@@ -1077,8 +1079,14 @@ async function listSales(db, opts = {}) {
     clauses.push('s.payment_method = ?');
     values.push(method);
   }
-  if (status === 'fiado') clauses.push('s.is_paid = 0');
-  else if (status === 'pago') clauses.push('s.is_paid = 1');
+  if (status === 'cancelada') clauses.push('s.cancelled_at IS NOT NULL');
+  else {
+    // Por padrao, vendas canceladas ficam fora de qualquer listagem —
+    // so aparecem escolhendo o status "Canceladas" de proposito.
+    clauses.push('s.cancelled_at IS NULL');
+    if (status === 'fiado') clauses.push('s.is_paid = 0');
+    else if (status === 'pago') clauses.push('s.is_paid = 1');
+  }
 
   let rows = await all(db, `
     SELECT s.*, c.name AS customer_name, c.phone AS customer_phone,
@@ -1132,7 +1140,7 @@ async function listCustomerSales(db, customerId) {
            c.group_name AS customer_group_name, c.debt AS customer_debt
     FROM sales s
     LEFT JOIN customers c ON c.id = s.customer_id
-    WHERE s.customer_id = ?
+    WHERE s.customer_id = ? AND s.cancelled_at IS NULL
     ORDER BY datetime(s.created_at) DESC, s.id DESC
   `, customerId);
   const itemsBySale = await getSaleItemsBulk(db, rows.map((r) => r.id));
@@ -1140,9 +1148,10 @@ async function listCustomerSales(db, customerId) {
 }
 
 // Cancela uma venda: devolve o estoque de cada item, reverte a divida (se era fiado) e apaga o registro.
-async function cancelSale(db, id) {
+async function cancelSale(db, id, cancelledBy) {
   const sale = await first(db, 'SELECT * FROM sales WHERE id = ?', id);
   if (!sale) throw new HttpError(404, 'Venda nao encontrada');
+  if (sale.cancelled_at) throw new HttpError(409, 'Essa venda ja estava cancelada');
   const items = await all(db, 'SELECT * FROM sale_items WHERE sale_id = ?', id);
 
   const comandos = items.map((item) =>
@@ -1161,8 +1170,11 @@ async function cancelSale(db, id) {
       .bind(valor, sale.customer_id));
   }
 
-  comandos.push(db.prepare('DELETE FROM sale_items WHERE sale_id = ?').bind(id));
-  comandos.push(db.prepare('DELETE FROM sales WHERE id = ?').bind(id));
+  // Antes a venda e os itens eram apagados do banco. Agora fica so marcada
+  // como cancelada — preserva vendedor, itens e valor para o relatorio saber
+  // de quem foram as vendas canceladas.
+  comandos.push(db.prepare('UPDATE sales SET cancelled_at = CURRENT_TIMESTAMP, cancelled_by = ? WHERE id = ?')
+    .bind(cancelledBy || null, id));
   await db.batch(comandos);
 
   return {
@@ -1305,12 +1317,14 @@ async function salesSummary(request, db) {
     values.push(endDate.length === 10 ? `${endDate} 23:59:59` : endDate);
   }
 
+  clauses.push('s.cancelled_at IS NULL');
+
   const rows = await all(db, `
     SELECT s.*, c.name AS customer_name, c.phone AS customer_phone,
            c.group_name AS customer_group_name, c.debt AS customer_debt
     FROM sales s
     LEFT JOIN customers c ON c.id = s.customer_id
-    ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+    WHERE ${clauses.join(' AND ')}
     ORDER BY datetime(s.created_at) DESC, s.id DESC
   `, ...values);
 
@@ -1407,6 +1421,118 @@ async function salesSummary(request, db) {
   };
 }
 
+
+// Painel de relatorio: faturamento por dia (vendas + pre-venda), cancelamentos
+// por vendedor e baixas de fiado por quem recebeu. Tudo filtravel por data,
+// categoria e produto.
+async function salesDashboard(db, opts = {}) {
+  const { startDate, endDate, category, productId } = opts;
+
+  const dateClauses = [];
+  const dateValues = [];
+  if (startDate) {
+    dateClauses.push('datetime(created_at) >= datetime(?)');
+    dateValues.push(startDate);
+  }
+  if (endDate) {
+    dateClauses.push('datetime(created_at) <= datetime(?)');
+    dateValues.push(endDate.length === 10 ? `${endDate} 23:59:59` : endDate);
+  }
+
+  const saleClauses = ['s.cancelled_at IS NULL', ...dateClauses.map((c) => c.replace('created_at', 's.created_at'))];
+  const rows = await all(db, `
+    SELECT s.* FROM sales s
+    WHERE ${saleClauses.join(' AND ')}
+    ORDER BY s.created_at
+  `, ...dateValues);
+  const itemsBySale = await getSaleItemsBulk(db, rows.map((r) => r.id));
+
+  const byDay = {};
+  let totalRevenue = 0;
+  let totalQuantity = 0;
+
+  for (const row of rows) {
+    const dayKey = sortableDate(row.created_at);
+    byDay[dayKey] ||= { date: dayKey, revenue: 0, quantity: 0, vouchers_revenue: 0 };
+    const items = itemsBySale.get(row.id) || [];
+
+    if (!productId && !category) {
+      // sem filtro: usa o total da venda direto, mais barato e igual ao Resumo
+      byDay[dayKey].revenue += numberValue(row.total_value);
+      const qty = items.reduce((acc, it) => acc + intValue(it.quantity), 0);
+      byDay[dayKey].quantity += qty;
+      totalRevenue += numberValue(row.total_value);
+      totalQuantity += qty;
+      continue;
+    }
+
+    for (const item of items) {
+      if (productId && item.product_id !== productId) continue;
+      if (category && (item.product?.category || 'Geral') !== category) continue;
+      const itemTotal = item.quantity * item.unit_sell_price;
+      byDay[dayKey].revenue += itemTotal;
+      byDay[dayKey].quantity += item.quantity;
+      totalRevenue += itemTotal;
+      totalQuantity += item.quantity;
+    }
+  }
+
+  // Pre-venda (vouchers) entra como faturamento no dia em que foi vendida —
+  // e quando o dinheiro efetivamente entra, a retirada e so a entrega do combo.
+  // So soma quando nao ha filtro de produto/categoria (voucher nao tem esse detalhe).
+  let vouchersTotal = 0;
+  if (!productId && !category) {
+    const voucherClauses = ["status != 'cancelado'", ...dateClauses];
+    const vRows = await all(db, `
+      SELECT created_at, total_value FROM vouchers WHERE ${voucherClauses.join(' AND ')}
+    `, ...dateValues);
+    for (const v of vRows) {
+      const dayKey = sortableDate(v.created_at);
+      byDay[dayKey] ||= { date: dayKey, revenue: 0, quantity: 0, vouchers_revenue: 0 };
+      byDay[dayKey].vouchers_revenue += numberValue(v.total_value);
+      vouchersTotal += numberValue(v.total_value);
+    }
+  }
+
+  const byDayArr = Object.values(byDay)
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((d) => ({ ...d, combined_revenue: Number((d.revenue + d.vouchers_revenue).toFixed(2)) }));
+
+  // Cancelamentos por vendedor original. So existe dado a partir desta correcao —
+  // antes a venda cancelada era apagada do banco e o vendedor original se perdia.
+  const cancelRows = await all(db, `
+    SELECT seller_username, COUNT(*) n, SUM(total_value) total
+    FROM sales WHERE cancelled_at IS NOT NULL
+    GROUP BY seller_username ORDER BY n DESC
+  `);
+  const cancelledBySeller = cancelRows.map((r) => ({
+    seller: r.seller_username || 'desconhecido', count: intValue(r.n), total: numberValue(r.total)
+  }));
+
+  // Baixas de fiado por quem recebeu
+  const payClauses = dateClauses;
+  const payRows = await all(db, `
+    SELECT username, COUNT(*) n, SUM(amount) total FROM payments
+    ${payClauses.length ? `WHERE ${payClauses.join(' AND ')}` : ''}
+    GROUP BY username ORDER BY total DESC
+  `, ...dateValues);
+  const paymentsByUser = payRows.map((r) => ({
+    username: r.username || 'desconhecido', count: intValue(r.n), total: numberValue(r.total)
+  }));
+
+  return {
+    filters: { start_date: startDate || null, end_date: endDate || null, category: category || null, product_id: productId || null },
+    by_day: byDayArr,
+    totals: {
+      revenue: Number(totalRevenue.toFixed(2)),
+      quantity: totalQuantity,
+      vouchers_revenue: Number(vouchersTotal.toFixed(2)),
+      combined_revenue: Number((totalRevenue + vouchersTotal).toFixed(2))
+    },
+    cancelled_by_seller: cancelledBySeller,
+    payments_by_user: paymentsByUser
+  };
+}
 
 async function handle(request, env, params, ctx = {}) {
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: json({}).headers });
@@ -1592,13 +1718,24 @@ async function handle(request, env, params, ctx = {}) {
     }
     if (second && third === 'cancel' && request.method === 'POST') {
       requireAdmin(currentUser);
-      return json(await cancelSale(db, intValue(second)));
+      return json(await cancelSale(db, intValue(second), currentUser.username));
     }
   }
 
   if (resource === 'reports' && second === 'summary' && request.method === 'GET') {
     requireAdmin(currentUser);
     return json(await salesSummary(request, db));
+  }
+
+  if (resource === 'reports' && second === 'dashboard' && request.method === 'GET') {
+    requireAdmin(currentUser);
+    const q = new URL(request.url).searchParams;
+    return json(await salesDashboard(db, {
+      startDate: q.get('start_date') || '',
+      endDate: q.get('end_date') || '',
+      category: q.get('category') || '',
+      productId: intValue(q.get('product_id')) || 0
+    }));
   }
 
   throw new HttpError(404, 'Rota nao encontrada');

@@ -18,7 +18,7 @@ import {
   AdminPanelSettings, Remove, Download, PointOfSale, QrCodeScanner,
   CameraAlt, UploadFile, Close, People, CloudUpload,
   PhotoCamera, ContentCopy, ManageSearch, QrCode2, CheckCircle, AccessTime,
-  ConfirmationNumber, Share, Fastfood, ReceiptLong, Refresh, PriceCheck
+  ConfirmationNumber, Share, Fastfood, ReceiptLong, Refresh, PriceCheck, QueryStats
 } from '@mui/icons-material';
 
 import QRCode from 'qrcode';
@@ -420,6 +420,14 @@ function App() {
   const [salesStatusFilter, setSalesStatusFilter] = useState('');
   const [salesMethodFilter, setSalesMethodFilter] = useState('');
   const [loadingSales, setLoadingSales] = useState(false);
+  // Modulo de Relatorio: painel filtravel (faturamento por dia, cancelamentos,
+  // baixas de fiado por vendedor)
+  const [reportStartDate, setReportStartDate] = useState('');
+  const [reportEndDate, setReportEndDate] = useState('');
+  const [reportCategory, setReportCategory] = useState('');
+  const [reportProduct, setReportProduct] = useState(null);
+  const [dashboard, setDashboard] = useState(null);
+  const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [users, setUsers] = useState([]);
   const [reportSummary, setReportSummary] = useState(null);
   const [paymentMethods, setPaymentMethods] = useState(FALLBACK_PAYMENT_METHODS);
@@ -630,6 +638,26 @@ function App() {
     }
   }, [salesPerPage, salesPage, salesQuery, salesStatusFilter, salesMethodFilter, showFeedback]);
 
+  // Painel de relatorio — refaz sempre que um filtro muda
+  const fetchDashboard = useCallback(async () => {
+    setLoadingDashboard(true);
+    try {
+      const { data } = await api.get('/reports/dashboard', {
+        params: {
+          start_date: reportStartDate || undefined,
+          end_date: reportEndDate || undefined,
+          category: reportCategory || undefined,
+          product_id: reportProduct?.id || undefined
+        }
+      });
+      setDashboard(data);
+    } catch {
+      showFeedback('Não consegui carregar o relatório.', 'error');
+    } finally {
+      setLoadingDashboard(false);
+    }
+  }, [reportStartDate, reportEndDate, reportCategory, reportProduct, showFeedback]);
+
   // Baixas de fiado — carrega paginado, so com a aba aberta
   const fetchPaymentsPage = useCallback(async (opts = {}) => {
     setLoadingPayments(true);
@@ -694,6 +722,12 @@ function App() {
     const timeoutId = window.setTimeout(() => { fetchPaymentsPage(); }, paymentsQuery ? 350 : 0);
     return () => window.clearTimeout(timeoutId);
   }, [token, isAdmin, tabValue, paymentsQuery, fetchPaymentsPage]);
+
+  // Relatorio: so busca com a aba aberta, refaz quando um filtro muda
+  useEffect(() => {
+    if (!token || !isAdmin || tabValue !== 'relatorio') return;
+    fetchDashboard();
+  }, [token, isAdmin, tabValue, fetchDashboard]);
 
   // Atualiza o estoque em tempo real enquanto a aba Consulta estiver aberta
   useEffect(() => {
@@ -886,6 +920,11 @@ function App() {
   const indirectCostTotal = reportSummary?.totals?.indirect_cost_total ?? categoryCostTotal;
   const cartTotal = cart.reduce((sum, item) => sum + (item.sell_price * item.quantity), 0);
   const categoryOptions = [...new Set(products.map((p) => p.category || 'Geral'))].sort();
+
+  // Produtos sem custo cadastrado — o lucro deles entra errado em qualquer relatorio
+  const zeroCostProducts = products
+    .filter((p) => !Number(p.cost_price))
+    .sort((a, b) => a.name.localeCompare(b.name));
 
   const filteredCustomers = customers
     .filter(c => normalizeText(c.name).includes(normalizeText(searchTerm)))
@@ -1782,6 +1821,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <Tab value="estoque" label="Estoque" icon={<Inventory />} />
             {isAdmin && <Tab value="vendas" label="Vendas" icon={<ReceiptLong />} />}
             {isAdmin && <Tab value="baixas" label="Baixas" icon={<PriceCheck />} />}
+            {isAdmin && <Tab value="relatorio" label="Relatório" icon={<QueryStats />} />}
             {isAdmin && <Tab value="usuarios" label="Usuários" icon={<AdminPanelSettings />} />}
             {isAdmin && <Tab value="atividade" label="Atividade" icon={<Storage />} />}
           </Tabs>
@@ -1927,6 +1967,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                       <MenuItem value="">Todos</MenuItem>
                       <MenuItem value="pago">Pagos</MenuItem>
                       <MenuItem value="fiado">Fiado</MenuItem>
+                      <MenuItem value="cancelada">Canceladas</MenuItem>
                     </Select>
                   </FormControl>
                 </Grid>
@@ -1977,18 +2018,22 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                           )}
                           <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>R$ {formatCurrency(sale.total_value)}</TableCell>
                           <TableCell>
-                            <Chip
-                              label={sale.payment_method_label || (sale.is_paid ? 'PAGO' : 'FIADO')}
-                              color={sale.is_paid ? 'success' : 'warning'}
-                              size="small" variant="outlined"
-                            />
+                            {sale.cancelled_at
+                              ? <Chip label="CANCELADA" color="default" size="small" variant="outlined" />
+                              : <Chip
+                                  label={sale.payment_method_label || (sale.is_paid ? 'PAGO' : 'FIADO')}
+                                  color={sale.is_paid ? 'success' : 'warning'}
+                                  size="small" variant="outlined"
+                                />}
                           </TableCell>
                           <TableCell align="center">
-                            <IconButton size="small" color="error" title="Cancelar venda (devolve o estoque)"
-                              disabled={cancellingSaleId === sale.id}
-                              onClick={() => handleCancelSale(sale)}>
-                              <Delete fontSize="small" />
-                            </IconButton>
+                            {!sale.cancelled_at && (
+                              <IconButton size="small" color="error" title="Cancelar venda (devolve o estoque)"
+                                disabled={cancellingSaleId === sale.id}
+                                onClick={() => handleCancelSale(sale)}>
+                                <Delete fontSize="small" />
+                              </IconButton>
+                            )}
                           </TableCell>
                         </TableRow>
                       );
@@ -2115,6 +2160,203 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 labelRowsPerPage="Por página"
                 labelDisplayedRows={({ from, to, count }) => `${from}-${to} de ${count}`}
               />
+            </Paper>
+          </Container>
+        )}
+
+        {/* === ABA RELATORIO (painel filtravel — somente admin) === */}
+        {tabValue === 'relatorio' && isAdmin && (
+          <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
+            <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
+              <Typography variant="h5">Relatório</Typography>
+              <Button size="small" startIcon={<Refresh />} onClick={fetchDashboard} disabled={loadingDashboard}>
+                Atualizar
+              </Button>
+            </Box>
+
+            <Paper sx={{ p: 2, mb: 2 }}>
+              <Grid container spacing={2} alignItems="center">
+                <Grid size={{ xs: 6, md: 3 }}>
+                  <TextField fullWidth size="small" label="De" type="date" InputLabelProps={{ shrink: true }}
+                    value={reportStartDate} onChange={(e) => setReportStartDate(e.target.value)} />
+                </Grid>
+                <Grid size={{ xs: 6, md: 3 }}>
+                  <TextField fullWidth size="small" label="Até" type="date" InputLabelProps={{ shrink: true }}
+                    value={reportEndDate} onChange={(e) => setReportEndDate(e.target.value)} />
+                </Grid>
+                <Grid size={{ xs: 6, md: 3 }}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>Categoria</InputLabel>
+                    <Select label="Categoria" value={reportCategory}
+                      onChange={(e) => { setReportCategory(e.target.value); setReportProduct(null); }}>
+                      <MenuItem value="">Todas</MenuItem>
+                      {categoryOptions.map((c) => <MenuItem key={c} value={c}>{c}</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                </Grid>
+                <Grid size={{ xs: 6, md: 3 }}>
+                  <Autocomplete options={products} getOptionLabel={(p) => p.name} value={reportProduct}
+                    onChange={(e, v) => { setReportProduct(v); if (v) setReportCategory(''); }}
+                    renderInput={(params) => <TextField {...params} label="Produto" size="small" />} size="small" />
+                </Grid>
+              </Grid>
+              {(reportStartDate || reportEndDate || reportCategory || reportProduct) && (
+                <Button size="small" sx={{ mt: 1 }}
+                  onClick={() => { setReportStartDate(''); setReportEndDate(''); setReportCategory(''); setReportProduct(null); }}>
+                  Limpar filtros
+                </Button>
+              )}
+            </Paper>
+
+            {loadingDashboard && <LinearProgress sx={{ mb: 2 }} />}
+
+            {dashboard && (
+              <>
+                <Grid container spacing={2} sx={{ mb: 2 }}>
+                  <Grid size={{ xs: 6, md: 3 }}>
+                    <Paper sx={{ p: 2, borderLeft: '5px solid #2196f3' }}>
+                      <Typography variant="caption" color="text.secondary">Vendas</Typography>
+                      <Typography variant={isMobile ? 'h6' : 'h5'} fontWeight="bold">R$ {formatCurrency(dashboard.totals.revenue)}</Typography>
+                    </Paper>
+                  </Grid>
+                  <Grid size={{ xs: 6, md: 3 }}>
+                    <Paper sx={{ p: 2, borderLeft: '5px solid #9c27b0' }}>
+                      <Typography variant="caption" color="text.secondary">Pré-venda</Typography>
+                      <Typography variant={isMobile ? 'h6' : 'h5'} fontWeight="bold">R$ {formatCurrency(dashboard.totals.vouchers_revenue)}</Typography>
+                    </Paper>
+                  </Grid>
+                  <Grid size={{ xs: 6, md: 3 }}>
+                    <Paper sx={{ p: 2, borderLeft: '5px solid #4caf50' }}>
+                      <Typography variant="caption" color="text.secondary">Faturamento total</Typography>
+                      <Typography variant={isMobile ? 'h6' : 'h5'} fontWeight="bold" color="success.main">R$ {formatCurrency(dashboard.totals.combined_revenue)}</Typography>
+                    </Paper>
+                  </Grid>
+                  <Grid size={{ xs: 6, md: 3 }}>
+                    <Paper sx={{ p: 2, borderLeft: '5px solid #ff9800' }}>
+                      <Typography variant="caption" color="text.secondary">Itens vendidos</Typography>
+                      <Typography variant={isMobile ? 'h6' : 'h5'} fontWeight="bold">{dashboard.totals.quantity}</Typography>
+                    </Paper>
+                  </Grid>
+                </Grid>
+
+                <Paper sx={{ p: isMobile ? 2 : 3, height: isMobile ? 280 : 360, mb: 2, display: 'flex', flexDirection: 'column' }}>
+                  <Typography variant="h6" gutterBottom>Faturamento por dia {reportProduct ? `— ${reportProduct.name}` : reportCategory ? `— ${reportCategory}` : ''}</Typography>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={dashboard.by_day.map((d) => ({ ...d, dia: format(parseISO(d.date), 'dd/MM') }))}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="dia" />
+                      <YAxis />
+                      <RechartsTooltip formatter={(v) => `R$ ${formatCurrency(v)}`} />
+                      <Legend />
+                      <Bar dataKey="revenue" name="Vendas" stackId="fat" fill="#1a237e" />
+                      <Bar dataKey="vouchers_revenue" name="Pré-venda" stackId="fat" fill="#9c27b0" radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </Paper>
+
+                <Paper sx={{ p: isMobile ? 2 : 3, height: isMobile ? 260 : 320, mb: 2, display: 'flex', flexDirection: 'column' }}>
+                  <Typography variant="h6" gutterBottom>Itens vendidos por dia</Typography>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={dashboard.by_day.map((d) => ({ ...d, dia: format(parseISO(d.date), 'dd/MM') }))}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="dia" />
+                      <YAxis />
+                      <RechartsTooltip formatter={(v) => `${v} un.`} />
+                      <Bar dataKey="quantity" name="Unidades" fill="#00897b" radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </Paper>
+
+                <Grid container spacing={2} sx={{ mb: 2 }}>
+                  <Grid size={{ xs: 12, md: 6 }}>
+                    <Paper sx={{ p: 2 }}>
+                      <Typography variant="h6" gutterBottom>Baixas de fiado por vendedor</Typography>
+                      {dashboard.payments_by_user.length === 0 ? (
+                        <Typography variant="body2" color="text.secondary">Nenhuma baixa no período.</Typography>
+                      ) : (
+                        <Table size="small">
+                          <TableHead><TableRow><TableCell>Vendedor</TableCell><TableCell align="center">Baixas</TableCell><TableCell align="right">Total</TableCell></TableRow></TableHead>
+                          <TableBody>
+                            {dashboard.payments_by_user.map((row) => (
+                              <TableRow key={row.username}>
+                                <TableCell>{row.username}</TableCell>
+                                <TableCell align="center">{row.count}</TableCell>
+                                <TableCell align="right">R$ {formatCurrency(row.total)}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      )}
+                    </Paper>
+                  </Grid>
+                  <Grid size={{ xs: 12, md: 6 }}>
+                    <Paper sx={{ p: 2 }}>
+                      <Typography variant="h6" gutterBottom>Vendas canceladas por vendedor</Typography>
+                      <Alert severity="info" sx={{ mb: 1.5 }}>
+                        Só conta cancelamentos feitos a partir de 07/09 — antes disso a venda cancelada era apagada do banco e não guardava quem tinha vendido.
+                      </Alert>
+                      {dashboard.cancelled_by_seller.length === 0 ? (
+                        <Typography variant="body2" color="text.secondary">Nenhum cancelamento registrado ainda.</Typography>
+                      ) : (
+                        <Table size="small">
+                          <TableHead><TableRow><TableCell>Vendedor</TableCell><TableCell align="center">Canceladas</TableCell><TableCell align="right">Total</TableCell></TableRow></TableHead>
+                          <TableBody>
+                            {dashboard.cancelled_by_seller.map((row) => (
+                              <TableRow key={row.seller}>
+                                <TableCell>{row.seller}</TableCell>
+                                <TableCell align="center">{row.count}</TableCell>
+                                <TableCell align="right">R$ {formatCurrency(row.total)}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      )}
+                    </Paper>
+                  </Grid>
+                </Grid>
+              </>
+            )}
+
+            <Paper sx={{ p: 2 }}>
+              <Typography variant="h6" gutterBottom>Produtos com custo zero</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+                Sem custo cadastrado, o lucro desses produtos não entra certo em nenhum relatório.
+              </Typography>
+              {zeroCostProducts.length === 0 ? (
+                <Typography variant="body2" color="success.main">Nenhum — todos os produtos têm custo cadastrado.</Typography>
+              ) : (
+                <TableContainer sx={{ maxHeight: 400 }}>
+                  <Table size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Produto</TableCell>
+                        <TableCell>Categoria</TableCell>
+                        <TableCell align="right">Venda</TableCell>
+                        <TableCell align="center">Estoque</TableCell>
+                        <TableCell align="center">Ação</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {zeroCostProducts.map((p) => (
+                        <TableRow key={p.id} hover>
+                          <TableCell>{p.name}</TableCell>
+                          <TableCell>{p.category || 'Geral'}</TableCell>
+                          <TableCell align="right">R$ {formatCurrency(p.sell_price)}</TableCell>
+                          <TableCell align="center">{p.stock}</TableCell>
+                          <TableCell align="center">
+                            <IconButton size="small" onClick={() => { setEditProductData({ ...p, category: p.category || 'Geral', barcode: p.barcode || '' }); setOpenEditProductDialog(true); }}>
+                              <Edit fontSize="small" />
+                            </IconButton>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              )}
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                {zeroCostProducts.length} de {products.length} produtos
+              </Typography>
             </Paper>
           </Container>
         )}
@@ -2678,6 +2920,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             <BottomNavigationAction label="Estoque" value="estoque" icon={<Inventory />} />
             {isAdmin && <BottomNavigationAction label="Vendas" value="vendas" icon={<ReceiptLong />} />}
             {isAdmin && <BottomNavigationAction label="Baixas" value="baixas" icon={<PriceCheck />} />}
+            {isAdmin && <BottomNavigationAction label="Relatório" value="relatorio" icon={<QueryStats />} />}
             {isAdmin && <BottomNavigationAction label="Usuários" value="usuarios" icon={<AdminPanelSettings />} />}
             {isAdmin && <BottomNavigationAction label="Atividade" value="atividade" icon={<Storage />} />}
           </BottomNavigation>

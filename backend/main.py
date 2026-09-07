@@ -8,7 +8,7 @@ import urllib.request
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, Text, func
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload, declarative_base
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -111,6 +111,10 @@ class Sale(Base):
     payment_reference = Column(String(200), nullable=True)
     event_day = Column(String(40), default="Dia 1")
     client_request_id = Column(String(64), nullable=True, unique=True, index=True)
+    # Cancelar uma venda nao apaga mais a linha: fica marcada, preservando
+    # vendedor e itens para o relatorio (quem teve venda cancelada).
+    cancelled_at = Column(DateTime, nullable=True)
+    cancelled_by = Column(String(120), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     customer = relationship("Customer")
@@ -159,6 +163,19 @@ class Voucher(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     redeemed_by = Column(String(120), nullable=True)
     redeemed_at = Column(DateTime, nullable=True)
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"))
+    amount = Column(Float)
+    username = Column(String(120), nullable=True)
+    note = Column(Text, nullable=True)
+    client_request_id = Column(String(64), nullable=True, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    customer = relationship("Customer")
 
 
 # --- SCHEMAS ---
@@ -216,6 +233,8 @@ class CustomerCreate(BaseModel):
 
 class DebtPayment(BaseModel):
     amount: float
+    client_request_id: Optional[str] = None
+    note: Optional[str] = None
 
 class SaleItemCreate(BaseModel):
     product_id: int
@@ -377,6 +396,8 @@ def serialize_sale(sale: Sale):
         "event_day": sale.event_day or "Dia 1",
         "sale_date": sale.created_at.date().isoformat(),
         "created_at": sale.created_at,
+        "cancelled_at": sale.cancelled_at,
+        "cancelled_by": sale.cancelled_by,
         "customer": serialize_customer(sale.customer) if sale.customer else None,
         "items": [serialize_sale_item(item) for item in sale.items]
     }
@@ -1004,14 +1025,25 @@ def delete_customer(id: int, db: Session = Depends(get_db), u: User = Depends(re
 
 @app.post("/customers/{id}/pay/")
 def pay_debt(id: int, pay: DebtPayment, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
+    client_request_id = (pay.client_request_id or "")[:64] or None
+    if client_request_id:
+        existing = db.query(Payment).filter(Payment.client_request_id == client_request_id).first()
+        if existing:
+            atual = db.query(Customer).filter(Customer.id == id).first()
+            return {"message": "Baixa já registrada", "duplicate": True, "debt": atual.debt if atual else None, "amount": existing.amount}
+
     c = db.query(Customer).filter(Customer.id == id).first()
     if not c:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
     if pay.amount <= 0:
         raise HTTPException(status_code=400, detail="Valor inválido")
-    c.debt -= pay.amount
+    if pay.amount > (c.debt or 0) + 0.001:
+        raise HTTPException(status_code=400, detail=f"Valor maior que a dívida. {c.name} deve R$ {c.debt:.2f}.")
+
+    c.debt = max(0, (c.debt or 0) - pay.amount)
+    db.add(Payment(customer_id=id, amount=pay.amount, username=u.username, note=pay.note, client_request_id=client_request_id))
     db.commit()
-    return {"message": "Pago"}
+    return {"message": "Pago", "debt": c.debt, "amount": pay.amount}
 
 @app.post("/customers/bulk")
 def bulk_create_customers(data: BulkCustomerCreate, db: Session = Depends(get_db), u: User = Depends(require_admin)):
@@ -1145,18 +1177,27 @@ def list_customer_sales(id: int, db: Session = Depends(get_db), u: User = Depend
     sales = db.query(Sale).options(
         joinedload(Sale.customer),
         joinedload(Sale.items).joinedload(SaleItem.product)
-    ).filter(Sale.customer_id == id).order_by(Sale.created_at.desc()).all()
+    ).filter(Sale.customer_id == id, Sale.cancelled_at.is_(None)).order_by(Sale.created_at.desc()).all()
     return [serialize_sale(sale) for sale in sales]
 
 
 # --- VENDAS ---
 
 @app.get("/sales/")
-def list_sales(db: Session = Depends(get_db), u: User = Depends(require_admin)):
-    sales = db.query(Sale).options(
+def list_sales(status: Optional[str] = None, db: Session = Depends(get_db), u: User = Depends(require_admin)):
+    query = db.query(Sale).options(
         joinedload(Sale.customer),
         joinedload(Sale.items).joinedload(SaleItem.product)
-    ).order_by(Sale.created_at.desc()).all()
+    )
+    if status == "cancelada":
+        query = query.filter(Sale.cancelled_at.isnot(None))
+    else:
+        query = query.filter(Sale.cancelled_at.is_(None))
+        if status == "fiado":
+            query = query.filter(Sale.is_paid.is_(False))
+        elif status == "pago":
+            query = query.filter(Sale.is_paid.is_(True))
+    sales = query.order_by(Sale.created_at.desc()).all()
     return [serialize_sale(sale) for sale in sales]
 
 @app.post("/sales/{id}/cancel")
@@ -1164,19 +1205,30 @@ def cancel_sale(id: int, db: Session = Depends(get_db), u: User = Depends(requir
     sale = db.query(Sale).options(joinedload(Sale.items)).filter(Sale.id == id).first()
     if not sale:
         raise HTTPException(status_code=404, detail="Venda não encontrada")
+    if sale.cancelled_at:
+        raise HTTPException(status_code=409, detail="Essa venda já estava cancelada")
     for item in sale.items:
         prod = db.query(Product).filter(Product.id == item.product_id).first()
         if prod:
             prod.stock = (prod.stock or 0) + item.quantity
+    # Se a venda era fiado e o cliente ja tinha quitado, sobra credito a devolver
+    credit_to_customer = 0.0
     if not sale.is_paid and sale.customer_id:
         cust = db.query(Customer).filter(Customer.id == sale.customer_id).first()
         if cust:
-            cust.debt = max(0, (cust.debt or 0) - sale.total_value)
+            divida_atual = cust.debt or 0
+            if sale.total_value > divida_atual:
+                credit_to_customer = round(sale.total_value - divida_atual, 2)
+            cust.debt = max(0, divida_atual - sale.total_value)
     restored = len(sale.items)
-    db.query(SaleItem).filter(SaleItem.sale_id == id).delete()
-    db.delete(sale)
+    # Nao apaga mais: fica marcada como cancelada, preservando vendedor e itens
+    sale.cancelled_at = datetime.utcnow()
+    sale.cancelled_by = u.username
     db.commit()
-    return {"message": "Venda cancelada e estoque restaurado", "restored_items": restored}
+    message = "Venda cancelada e estoque restaurado"
+    if credit_to_customer > 0:
+        message = f"Venda cancelada. Atenção: o cliente já tinha pago, devolver R$ {credit_to_customer:.2f}."
+    return {"message": message, "restored_items": restored, "credit_to_customer": credit_to_customer}
 
 
 @app.post("/sales/")
@@ -1274,7 +1326,7 @@ def sales_summary(
     query = db.query(Sale).options(
         joinedload(Sale.customer),
         joinedload(Sale.items).joinedload(SaleItem.product)
-    )
+    ).filter(Sale.cancelled_at.is_(None))
 
     if event_day:
         query = query.filter(Sale.event_day == event_day)
@@ -1375,6 +1427,115 @@ def sales_summary(
         "category_costs": [serialize_category_cost(cost) for cost in category_costs],
         "top_products": sorted(by_product.values(), key=lambda row: row["total"], reverse=True),
         "sales": [serialize_sale(sale) for sale in sales]
+    }
+
+
+@app.get("/reports/dashboard")
+def sales_dashboard(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    category: Optional[str] = None,
+    product_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    u: User = Depends(require_admin)
+):
+    query = db.query(Sale).options(
+        joinedload(Sale.items).joinedload(SaleItem.product)
+    ).filter(Sale.cancelled_at.is_(None))
+    if start_date:
+        query = query.filter(Sale.created_at >= datetime.fromisoformat(start_date))
+    if end_date:
+        end = datetime.fromisoformat(end_date)
+        if len(end_date) == 10:
+            end = end.replace(hour=23, minute=59, second=59)
+        query = query.filter(Sale.created_at <= end)
+    sales = query.all()
+
+    by_day = {}
+    total_revenue = 0.0
+    total_quantity = 0
+
+    for sale in sales:
+        day_key = sale.created_at.date().isoformat()
+        by_day.setdefault(day_key, {"date": day_key, "revenue": 0.0, "quantity": 0, "vouchers_revenue": 0.0})
+
+        if not product_id and not category:
+            by_day[day_key]["revenue"] += sale.total_value
+            qty = sum(item.quantity for item in sale.items)
+            by_day[day_key]["quantity"] += qty
+            total_revenue += sale.total_value
+            total_quantity += qty
+            continue
+
+        for item in sale.items:
+            if product_id and item.product_id != product_id:
+                continue
+            item_category = item.product.category if item.product and item.product.category else "Geral"
+            if category and item_category != category:
+                continue
+            item_total = item.quantity * item.unit_sell_price
+            by_day[day_key]["revenue"] += item_total
+            by_day[day_key]["quantity"] += item.quantity
+            total_revenue += item_total
+            total_quantity += item.quantity
+
+    # Pre-venda (vouchers) entra como faturamento no dia da venda do combo —
+    # o dinheiro ja entrou ali, a retirada e so a entrega.
+    vouchers_total = 0.0
+    if not product_id and not category:
+        v_query = db.query(Voucher).filter(Voucher.status != "cancelado")
+        if start_date:
+            v_query = v_query.filter(Voucher.created_at >= datetime.fromisoformat(start_date))
+        if end_date:
+            end = datetime.fromisoformat(end_date)
+            if len(end_date) == 10:
+                end = end.replace(hour=23, minute=59, second=59)
+            v_query = v_query.filter(Voucher.created_at <= end)
+        for v in v_query.all():
+            day_key = v.created_at.date().isoformat()
+            by_day.setdefault(day_key, {"date": day_key, "revenue": 0.0, "quantity": 0, "vouchers_revenue": 0.0})
+            by_day[day_key]["vouchers_revenue"] += v.total_value or 0
+            vouchers_total += v.total_value or 0
+
+    by_day_list = sorted(by_day.values(), key=lambda row: row["date"])
+    for row in by_day_list:
+        row["combined_revenue"] = round(row["revenue"] + row["vouchers_revenue"], 2)
+
+    # Cancelamentos por vendedor original — so existe dado a partir desta correcao
+    cancel_rows = db.query(
+        Sale.seller_username, func.count(Sale.id), func.sum(Sale.total_value)
+    ).filter(Sale.cancelled_at.isnot(None)).group_by(Sale.seller_username).order_by(func.count(Sale.id).desc()).all()
+    cancelled_by_seller = [
+        {"seller": seller or "desconhecido", "count": count, "total": total or 0}
+        for seller, count, total in cancel_rows
+    ]
+
+    # Baixas de fiado por quem recebeu
+    pay_query = db.query(Payment.username, func.count(Payment.id), func.sum(Payment.amount))
+    if start_date:
+        pay_query = pay_query.filter(Payment.created_at >= datetime.fromisoformat(start_date))
+    if end_date:
+        end = datetime.fromisoformat(end_date)
+        if len(end_date) == 10:
+            end = end.replace(hour=23, minute=59, second=59)
+        pay_query = pay_query.filter(Payment.created_at <= end)
+    pay_rows = pay_query.group_by(Payment.username).order_by(func.sum(Payment.amount).desc()).all()
+    payments_by_user = [
+        {"username": username or "desconhecido", "count": count, "total": total or 0}
+        for username, count, total in pay_rows
+    ]
+
+    return {
+        "filters": {"start_date": start_date, "end_date": end_date, "category": category, "product_id": product_id},
+        "by_day": by_day_list,
+        "totals": {
+            "revenue": round(total_revenue, 2),
+            "quantity": total_quantity,
+            "vouchers_revenue": round(vouchers_total, 2),
+            "combined_revenue": round(total_revenue + vouchers_total, 2)
+        },
+        "cancelled_by_seller": cancelled_by_seller,
+        "payments_by_user": payments_by_user
     }
 
 
