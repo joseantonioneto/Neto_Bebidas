@@ -1,4 +1,4 @@
-const CACHE_NAME = 'mercadinho-caminhar-v18';
+const CACHE_NAME = 'mercadinho-caminhar-v19';
 const APP_SHELL = [
   '/',
   '/index.html',

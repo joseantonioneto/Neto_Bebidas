@@ -1622,8 +1622,9 @@ function extractSupplier(productName) {
   return supplier || null;
 }
 
-// Vendas agrupadas por fornecedor (extraido do nome do produto), com a lista
-// de itens de cada um para o modal: o que foi vendido, para quem e por quem.
+// Vendas agrupadas por fornecedor (extraido do nome do produto). Cada
+// fornecedor traz o consolidado por produto: quanto entrou, quanto vendeu e
+// quanto ainda tem em estoque — e o que o modal do relatorio mostra.
 async function supplierSales(db, opts = {}) {
   const { startDate, endDate } = opts;
   const clauses = ['s.cancelled_at IS NULL'];
@@ -1637,80 +1638,95 @@ async function supplierSales(db, opts = {}) {
     values.push(endDate.length === 10 ? `${endDate} 23:59:59` : endDate);
   }
 
+  // 1) Comeca pelos produtos: assim um item que nunca vendeu, mas tem estoque,
+  //    tambem aparece no relatorio do fornecedor.
+  const produtos = await all(db, 'SELECT id, name, stock FROM products ORDER BY name');
+  const bySupplier = {};
+  const produtoIndex = new Map();
+  const semFornecedor = { products_count: 0, stock: 0 };
+
+  for (const prod of produtos) {
+    const supplier = extractSupplier(prod.name);
+    if (!supplier) {
+      semFornecedor.products_count += 1;
+      semFornecedor.stock += intValue(prod.stock);
+      continue;
+    }
+    bySupplier[supplier] ||= {
+      supplier, quantity: 0, revenue: 0, cost: 0, sales_count: 0,
+      products_count: 0, stock: 0, products: []
+    };
+    const linha = {
+      product_id: prod.id,
+      name: prod.name,
+      stock: intValue(prod.stock),
+      quantity: 0,
+      revenue: 0,
+      cost: 0
+    };
+    bySupplier[supplier].products_count += 1;
+    bySupplier[supplier].stock += linha.stock;
+    bySupplier[supplier].products.push(linha);
+    produtoIndex.set(prod.id, linha);
+  }
+
+  // 2) Soma as vendas em cima de cada produto
   const rows = await all(db, `
-    SELECT si.quantity, si.unit_sell_price, si.unit_cost_price, si.product_id, p.name AS product_name,
-           s.id AS sale_id, s.created_at, s.seller_username, c.name AS customer_name
+    SELECT si.product_id, si.quantity, si.unit_sell_price, si.unit_cost_price,
+           p.name AS product_name
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
     LEFT JOIN products p ON p.id = si.product_id
-    LEFT JOIN customers c ON c.id = s.customer_id
     WHERE ${clauses.join(' AND ')}
-    ORDER BY datetime(s.created_at) DESC
   `, ...values);
 
-  const bySupplier = {};
   let unmatchedQty = 0;
   let unmatchedRevenue = 0;
   let unmatchedCount = 0;
 
   for (const row of rows) {
     const supplier = extractSupplier(row.product_name);
-    const total = Number((row.quantity * row.unit_sell_price).toFixed(2));
+    const total = row.quantity * numberValue(row.unit_sell_price);
+    const custo = row.quantity * numberValue(row.unit_cost_price);
     if (!supplier) {
       unmatchedQty += row.quantity;
       unmatchedRevenue += total;
       unmatchedCount += 1;
       continue;
     }
-    bySupplier[supplier] ||= {
-      supplier, quantity: 0, revenue: 0, cost: 0, sales_count: 0,
-      products_count: 0, stock: 0, items: []
-    };
-    bySupplier[supplier].quantity += row.quantity;
-    bySupplier[supplier].revenue += total;
-    bySupplier[supplier].cost += row.quantity * numberValue(row.unit_cost_price);
-    bySupplier[supplier].sales_count += 1;
-    bySupplier[supplier].items.push({
-      sale_id: row.sale_id,
-      product_name: row.product_name || `Produto ${row.product_id}`,
-      quantity: intValue(row.quantity),
-      unit_sell_price: numberValue(row.unit_sell_price),
-      total,
-      customer_name: row.customer_name || 'Consumidor Final',
-      seller_username: row.seller_username || 'desconhecido',
-      created_at: row.created_at
-    });
-  }
+    const grupo = bySupplier[supplier];
+    if (!grupo) continue;
+    grupo.quantity += row.quantity;
+    grupo.revenue += total;
+    grupo.cost += custo;
+    grupo.sales_count += 1;
 
-  // Estoque atual por fornecedor. Nao existe log confiavel de entrada de
-  // mercadoria, entao a entrada e deduzida: o que ainda esta em estoque mais
-  // o que ja foi vendido. Ajuste manual de estoque distorce essa conta.
-  const produtos = await all(db, 'SELECT id, name, stock FROM products');
-  let unmatchedStock = 0;
-  let unmatchedProducts = 0;
-  for (const prod of produtos) {
-    const supplier = extractSupplier(prod.name);
-    if (!supplier) {
-      unmatchedStock += intValue(prod.stock);
-      unmatchedProducts += 1;
-      continue;
+    const linha = produtoIndex.get(row.product_id);
+    if (linha) {
+      linha.quantity += row.quantity;
+      linha.revenue += total;
+      linha.cost += custo;
     }
-    bySupplier[supplier] ||= {
-      supplier, quantity: 0, revenue: 0, cost: 0, sales_count: 0,
-      products_count: 0, stock: 0, items: []
-    };
-    bySupplier[supplier].products_count += 1;
-    bySupplier[supplier].stock += intValue(prod.stock);
   }
 
+  // 3) Fecha os numeros. Nao existe log de entrada de mercadoria, entao a
+  //    entrada e deduzida: o que ainda esta em estoque mais o que ja vendeu.
   const suppliers = Object.values(bySupplier)
-    .map((s) => ({
-      ...s,
-      revenue: Number(s.revenue.toFixed(2)),
-      cost: Number(s.cost.toFixed(2)),
-      profit: Number((s.revenue - s.cost).toFixed(2)),
-      // entrada estimada = ainda em estoque + ja vendido
-      entrada: s.stock + s.quantity
+    .map((grupo) => ({
+      ...grupo,
+      revenue: Number(grupo.revenue.toFixed(2)),
+      cost: Number(grupo.cost.toFixed(2)),
+      profit: Number((grupo.revenue - grupo.cost).toFixed(2)),
+      entrada: grupo.stock + grupo.quantity,
+      products: grupo.products
+        .map((linha) => ({
+          ...linha,
+          revenue: Number(linha.revenue.toFixed(2)),
+          cost: Number(linha.cost.toFixed(2)),
+          profit: Number((linha.revenue - linha.cost).toFixed(2)),
+          entrada: linha.stock + linha.quantity
+        }))
+        .sort((a, b) => b.revenue - a.revenue || a.name.localeCompare(b.name))
     }))
     .sort((a, b) => b.revenue - a.revenue);
 
@@ -1721,9 +1737,9 @@ async function supplierSales(db, opts = {}) {
       quantity: unmatchedQty,
       revenue: Number(unmatchedRevenue.toFixed(2)),
       sales_count: unmatchedCount,
-      products_count: unmatchedProducts,
-      stock: unmatchedStock,
-      entrada: unmatchedStock + unmatchedQty
+      products_count: semFornecedor.products_count,
+      stock: semFornecedor.stock,
+      entrada: semFornecedor.stock + unmatchedQty
     }
   };
 }
