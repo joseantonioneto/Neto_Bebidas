@@ -449,6 +449,7 @@ function App() {
   const [pixNow, setPixNow] = useState(0);
   const [stockQuery, setStockQuery] = useState('');
   const [stockCategoryFilter, setStockCategoryFilter] = useState('');
+  const [stockDetailProduct, setStockDetailProduct] = useState(null);
   const [estoqueQuery, setEstoqueQuery] = useState('');
   const [estoqueCategoryFilter, setEstoqueCategoryFilter] = useState('');
   const [estoqueSemFornecedor, setEstoqueSemFornecedor] = useState(false);
@@ -2730,7 +2731,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                       const color = out ? '#c62828' : low ? '#ef6c00' : '#2e7d32';
                       return (
                         <Grid size={{ xs: 12, sm: 6, md: 4 }} key={p.id}>
-                          <Paper variant="outlined" sx={{ p: 1.25, display: 'flex', alignItems: 'center', gap: 1.5, borderLeft: `5px solid ${color}` }}>
+                          <Paper variant="outlined" onClick={() => setStockDetailProduct(p)} sx={{ p: 1.25, display: 'flex', alignItems: 'center', gap: 1.5, borderLeft: `5px solid ${color}`, cursor: 'pointer', '&:hover': { boxShadow: 2 } }}>
                             {p.photo
                               ? <Box component="img" src={p.photo} alt={p.name} sx={{ width: 48, height: 48, borderRadius: 1, objectFit: 'cover', flexShrink: 0 }} />
                               : <Box sx={{ width: 48, height: 48, borderRadius: 1, bgcolor: '#eceff1', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><Storefront sx={{ color: '#b0bec5' }} /></Box>}
@@ -3156,6 +3157,51 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           <Button onClick={() => setOpenNewClientDialog(false)}>Cancelar</Button>
           <Button onClick={handleCreateCustomer} variant="contained">Salvar</Button>
         </DialogActions>
+      </Dialog>
+
+      {/* Detalhe do produto na Consulta — nome completo e foto ampliada, sem cortar */}
+      <Dialog open={!!stockDetailProduct} onClose={() => setStockDetailProduct(null)} fullWidth maxWidth="xs">
+        {stockDetailProduct && (() => {
+          const p = stockDetailProduct;
+          const out = p.stock <= 0;
+          const low = !out && p.stock < 5;
+          const color = out ? '#c62828' : low ? '#ef6c00' : '#2e7d32';
+          return (
+            <>
+              <DialogContent sx={{ pt: 3, textAlign: 'center' }}>
+                {p.photo
+                  ? <Box component="img" src={p.photo} alt={p.name} sx={{ width: 200, height: 200, borderRadius: 2, objectFit: 'cover', mx: 'auto', mb: 2 }} />
+                  : <Box sx={{ width: 200, height: 200, borderRadius: 2, bgcolor: '#eceff1', display: 'flex', alignItems: 'center', justifyContent: 'center', mx: 'auto', mb: 2 }}><Storefront sx={{ fontSize: 64, color: '#b0bec5' }} /></Box>}
+                <Typography variant="h6" fontWeight="bold">{p.name}</Typography>
+                <Chip label={p.category || 'Geral'} size="small" sx={{ mt: 1 }} />
+                {p.barcode && <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>Código: {p.barcode}</Typography>}
+                <Grid container spacing={2} sx={{ mt: 1 }}>
+                  <Grid size={6}>
+                    <Paper variant="outlined" sx={{ p: 1.5 }}>
+                      <Typography variant="caption" color="text.secondary">Preço</Typography>
+                      <Typography variant="h6" fontWeight="bold">R$ {formatCurrency(p.sell_price)}</Typography>
+                    </Paper>
+                  </Grid>
+                  <Grid size={6}>
+                    <Paper variant="outlined" sx={{ p: 1.5, borderColor: color }}>
+                      <Typography variant="caption" color="text.secondary">Estoque</Typography>
+                      <Typography variant="h6" fontWeight="900" sx={{ color }}>{p.stock}</Typography>
+                      <Typography variant="caption" sx={{ color }}>{out ? 'esgotado' : 'em estoque'}</Typography>
+                    </Paper>
+                  </Grid>
+                </Grid>
+              </DialogContent>
+              <DialogActions>
+                {isAdmin && (
+                  <Button onClick={() => { setStockDetailProduct(null); setEditProductData({ ...p, category: p.category || 'Geral', barcode: p.barcode || '' }); setOpenEditProductDialog(true); }}>
+                    Editar
+                  </Button>
+                )}
+                <Button onClick={() => setStockDetailProduct(null)} variant="contained">Fechar</Button>
+              </DialogActions>
+            </>
+          );
+        })()}
       </Dialog>
 
       {/* Itens vendidos de um fornecedor — o que foi vendido, para quem e por quem */}
