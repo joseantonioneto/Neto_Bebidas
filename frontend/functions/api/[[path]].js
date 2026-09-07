@@ -395,7 +395,7 @@ async function getCurrentUser(request, env, db) {
   const match = auth.match(/^Bearer\s+(.+)$/i);
   if (!match) throw new HttpError(401, 'Nao autenticado');
   const payload = await verifyAccessToken(match[1], env);
-  const user = await first(db, 'SELECT * FROM users WHERE username = ?', payload.sub);
+  const user = await first(db, 'SELECT * FROM users WHERE username = ? AND deleted_at IS NULL', payload.sub);
   if (!user) throw new HttpError(401, 'Usuario nao encontrado');
   if (!user.role) user.role = ADMIN_ROLE;
   return user;
@@ -493,7 +493,7 @@ async function login(request, env, db, ctx = {}) {
   const password = String(form.password || '');
   ctx.loginUsername = username;
   await verifyTurnstile(request, env, form.turnstileToken);
-  const user = await first(db, 'SELECT * FROM users WHERE username = ?', username);
+  const user = await first(db, 'SELECT * FROM users WHERE username = ? AND deleted_at IS NULL', username);
   if (!user || !bcrypt.compareSync(password, user.hashed_password || '')) {
     throw new HttpError(400, 'Login incorreto');
   }
@@ -506,7 +506,7 @@ async function login(request, env, db, ctx = {}) {
 }
 
 async function listUsers(db) {
-  const rows = await all(db, 'SELECT * FROM users ORDER BY username');
+  const rows = await all(db, 'SELECT * FROM users WHERE deleted_at IS NULL ORDER BY username');
   return rows.map(serializeUser);
 }
 
@@ -555,7 +555,7 @@ async function updateUser(request, db, id) {
   if (data.role) {
     const role = normalizeRole(data.role);
     if (user.role === ADMIN_ROLE && role !== ADMIN_ROLE) {
-      const row = await first(db, 'SELECT COUNT(*) AS count FROM users WHERE role = ?', ADMIN_ROLE);
+      const row = await first(db, 'SELECT COUNT(*) AS count FROM users WHERE role = ? AND deleted_at IS NULL', ADMIN_ROLE);
       ensureAdminWillRemain(row.count, user);
     }
     updates.push('role = ?');
@@ -601,12 +601,16 @@ async function changeOwnPassword(request, db, currentUser) {
 async function deleteUser(db, id, currentUser) {
   const user = await first(db, 'SELECT * FROM users WHERE id = ?', id);
   if (!user) throw new HttpError(404, 'Usuario nao encontrado');
+  if (user.deleted_at) throw new HttpError(404, 'Usuario ja estava excluido');
   if (user.id === currentUser.id) throw new HttpError(400, 'Voce nao pode excluir o proprio usuario');
   if (user.role === ADMIN_ROLE) {
-    const row = await first(db, 'SELECT COUNT(*) AS count FROM users WHERE role = ?', ADMIN_ROLE);
+    const row = await first(db, 'SELECT COUNT(*) AS count FROM users WHERE role = ? AND deleted_at IS NULL', ADMIN_ROLE);
     ensureAdminWillRemain(row.count, user);
   }
-  await run(db, 'DELETE FROM users WHERE id = ?', id);
+  // Nunca apaga: marca deleted_at, o usuario some das listas e perde acesso
+  // (login e token passam a exigir deleted_at IS NULL), mas o historico de
+  // vendas/log continua apontando para o mesmo username.
+  await run(db, 'UPDATE users SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?', id);
   return { message: 'Usuario excluido' };
 }
 
@@ -700,11 +704,12 @@ async function listCategoryCosts(db, filters = {}) {
     clauses.push('datetime(created_at) <= datetime(?)');
     values.push(filters.endDate.length === 10 ? `${filters.endDate} 23:59:59` : filters.endDate);
   }
+  clauses.push('deleted_at IS NULL');
 
   const rows = await all(db, `
     SELECT *
     FROM category_costs
-    ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+    WHERE ${clauses.join(' AND ')}
     ORDER BY datetime(created_at) DESC, id DESC
   `, ...values);
   return rows.map(serializeCategoryCost);
@@ -735,7 +740,8 @@ async function createCategoryCost(request, db) {
 async function deleteCategoryCost(db, id) {
   const cost = await first(db, 'SELECT * FROM category_costs WHERE id = ?', id);
   if (!cost) throw new HttpError(404, 'Custo nao encontrado');
-  await run(db, 'DELETE FROM category_costs WHERE id = ?', id);
+  if (cost.deleted_at) throw new HttpError(404, 'Custo ja estava removido');
+  await run(db, 'UPDATE category_costs SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?', id);
   return { message: 'Custo removido' };
 }
 
@@ -842,7 +848,7 @@ async function importNfe(request, db) {
 }
 
 async function listCustomers(db) {
-  const rows = await all(db, 'SELECT * FROM customers ORDER BY name');
+  const rows = await all(db, 'SELECT * FROM customers WHERE deleted_at IS NULL ORDER BY name');
   return rows.map(serializeCustomer);
 }
 
@@ -880,8 +886,11 @@ async function updateCustomer(request, db, id) {
 async function deleteCustomer(db, id) {
   const customer = await first(db, 'SELECT * FROM customers WHERE id = ?', id);
   if (!customer) throw new HttpError(404, 'Cliente nao encontrado');
+  if (customer.deleted_at) throw new HttpError(404, 'Cliente ja estava excluido');
   if (numberValue(customer.debt) > 0) throw new HttpError(400, 'Cliente possui divida pendente');
-  await run(db, 'DELETE FROM customers WHERE id = ?', id);
+  // Nunca apaga: marca deleted_at. As compras dele continuam no historico e
+  // em relatorio, so nao aparece mais para nova venda/fiado.
+  await run(db, 'UPDATE customers SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?', id);
   return { message: 'Cliente excluido' };
 }
 
@@ -932,6 +941,7 @@ async function listPayments(db, opts = {}) {
     SELECT p.*, c.name AS customer_name, c.group_name AS customer_group_name, c.debt AS customer_debt
     FROM payments p
     LEFT JOIN customers c ON c.id = p.customer_id
+    WHERE p.deleted_at IS NULL
     ORDER BY datetime(p.created_at) DESC, p.id DESC
   `);
 
@@ -958,14 +968,15 @@ async function listPayments(db, opts = {}) {
   return { items, total, total_amount: somaTotal, limit, offset };
 }
 
-// Estorna uma baixa: devolve o valor para a divida do cliente e apaga o registro
+// Estorna uma baixa: devolve o valor para a divida do cliente e marca deleted_at
 async function cancelPayment(db, id) {
   const pagamento = await first(db, 'SELECT * FROM payments WHERE id = ?', id);
   if (!pagamento) throw new HttpError(404, 'Baixa nao encontrada');
+  if (pagamento.deleted_at) throw new HttpError(404, 'Baixa ja estava estornada');
   await db.batch([
     db.prepare('UPDATE customers SET debt = debt + ? WHERE id = ?')
       .bind(numberValue(pagamento.amount), pagamento.customer_id),
-    db.prepare('DELETE FROM payments WHERE id = ?').bind(id)
+    db.prepare('UPDATE payments SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?').bind(id)
   ]);
   return { message: 'Baixa estornada', amount: numberValue(pagamento.amount) };
 }
@@ -1119,7 +1130,7 @@ async function customerStatement(db, customerId) {
   const sales = await listCustomerSales(db, customerId);
   const pays = await all(db, `
     SELECT id, amount, username, note, created_at FROM payments
-    WHERE customer_id = ? ORDER BY datetime(created_at) DESC, id DESC
+    WHERE customer_id = ? AND deleted_at IS NULL ORDER BY datetime(created_at) DESC, id DESC
   `, customerId);
   const payments = pays.map((p) => ({
     id: p.id, amount: numberValue(p.amount), username: p.username, note: p.note, created_at: p.created_at
@@ -1206,7 +1217,7 @@ async function createSale(request, db, user) {
   if (paymentMethod === 'fiado') isPaid = false;
 
   const customer = await first(db, 'SELECT * FROM customers WHERE id = ?', intValue(data.customer_id));
-  if (!customer) throw new HttpError(404, 'Cliente nao encontrado');
+  if (!customer || customer.deleted_at) throw new HttpError(404, 'Cliente nao encontrado');
   if (!isPaid && customer.name === DEFAULT_CUSTOMER_NAME) {
     throw new HttpError(400, 'Fiado exige um cliente identificado. Selecione ou cadastre o cliente.');
   }
@@ -1498,22 +1509,12 @@ async function salesDashboard(db, opts = {}) {
     .sort((a, b) => a.date.localeCompare(b.date))
     .map((d) => ({ ...d, combined_revenue: Number((d.revenue + d.vouchers_revenue).toFixed(2)) }));
 
-  // Cancelamentos por vendedor original. So existe dado a partir desta correcao —
-  // antes a venda cancelada era apagada do banco e o vendedor original se perdia.
-  const cancelRows = await all(db, `
-    SELECT seller_username, COUNT(*) n, SUM(total_value) total
-    FROM sales WHERE cancelled_at IS NOT NULL
-    GROUP BY seller_username ORDER BY n DESC
-  `);
-  const cancelledBySeller = cancelRows.map((r) => ({
-    seller: r.seller_username || 'desconhecido', count: intValue(r.n), total: numberValue(r.total)
-  }));
-
   // Baixas de fiado por quem recebeu
   const payClauses = dateClauses;
+  payClauses.push('deleted_at IS NULL');
   const payRows = await all(db, `
     SELECT username, COUNT(*) n, SUM(amount) total FROM payments
-    ${payClauses.length ? `WHERE ${payClauses.join(' AND ')}` : ''}
+    WHERE ${payClauses.join(' AND ')}
     GROUP BY username ORDER BY total DESC
   `, ...dateValues);
   const paymentsByUser = payRows.map((r) => ({
@@ -1529,8 +1530,88 @@ async function salesDashboard(db, opts = {}) {
       vouchers_revenue: Number(vouchersTotal.toFixed(2)),
       combined_revenue: Number((totalRevenue + vouchersTotal).toFixed(2))
     },
-    cancelled_by_seller: cancelledBySeller,
     payments_by_user: paymentsByUser
+  };
+}
+
+// Extrai o fornecedor do nome do produto, quando cadastrado como
+// "Descrição - Fornecedor" (convencao usada no cadastro em lote).
+function extractSupplier(productName) {
+  const name = String(productName || '');
+  const idx = name.lastIndexOf(' - ');
+  if (idx === -1) return null;
+  const supplier = name.slice(idx + 3).trim();
+  return supplier || null;
+}
+
+// Vendas agrupadas por fornecedor (extraido do nome do produto), com a lista
+// de itens de cada um para o modal: o que foi vendido, para quem e por quem.
+async function supplierSales(db, opts = {}) {
+  const { startDate, endDate } = opts;
+  const clauses = ['s.cancelled_at IS NULL'];
+  const values = [];
+  if (startDate) {
+    clauses.push('datetime(s.created_at) >= datetime(?)');
+    values.push(startDate);
+  }
+  if (endDate) {
+    clauses.push('datetime(s.created_at) <= datetime(?)');
+    values.push(endDate.length === 10 ? `${endDate} 23:59:59` : endDate);
+  }
+
+  const rows = await all(db, `
+    SELECT si.quantity, si.unit_sell_price, si.product_id, p.name AS product_name,
+           s.id AS sale_id, s.created_at, s.seller_username, c.name AS customer_name
+    FROM sale_items si
+    JOIN sales s ON s.id = si.sale_id
+    LEFT JOIN products p ON p.id = si.product_id
+    LEFT JOIN customers c ON c.id = s.customer_id
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY datetime(s.created_at) DESC
+  `, ...values);
+
+  const bySupplier = {};
+  let unmatchedQty = 0;
+  let unmatchedRevenue = 0;
+  let unmatchedCount = 0;
+
+  for (const row of rows) {
+    const supplier = extractSupplier(row.product_name);
+    const total = Number((row.quantity * row.unit_sell_price).toFixed(2));
+    if (!supplier) {
+      unmatchedQty += row.quantity;
+      unmatchedRevenue += total;
+      unmatchedCount += 1;
+      continue;
+    }
+    bySupplier[supplier] ||= { supplier, quantity: 0, revenue: 0, sales_count: 0, items: [] };
+    bySupplier[supplier].quantity += row.quantity;
+    bySupplier[supplier].revenue += total;
+    bySupplier[supplier].sales_count += 1;
+    bySupplier[supplier].items.push({
+      sale_id: row.sale_id,
+      product_name: row.product_name || `Produto ${row.product_id}`,
+      quantity: intValue(row.quantity),
+      unit_sell_price: numberValue(row.unit_sell_price),
+      total,
+      customer_name: row.customer_name || 'Consumidor Final',
+      seller_username: row.seller_username || 'desconhecido',
+      created_at: row.created_at
+    });
+  }
+
+  const suppliers = Object.values(bySupplier)
+    .map((s) => ({ ...s, revenue: Number(s.revenue.toFixed(2)) }))
+    .sort((a, b) => b.revenue - a.revenue);
+
+  return {
+    filters: { start_date: startDate || null, end_date: endDate || null },
+    suppliers,
+    unmatched: {
+      quantity: unmatchedQty,
+      revenue: Number(unmatchedRevenue.toFixed(2)),
+      sales_count: unmatchedCount
+    }
   };
 }
 
@@ -1735,6 +1816,15 @@ async function handle(request, env, params, ctx = {}) {
       endDate: q.get('end_date') || '',
       category: q.get('category') || '',
       productId: intValue(q.get('product_id')) || 0
+    }));
+  }
+
+  if (resource === 'reports' && second === 'suppliers' && request.method === 'GET') {
+    requireAdmin(currentUser);
+    const q = new URL(request.url).searchParams;
+    return json(await supplierSales(db, {
+      startDate: q.get('start_date') || '',
+      endDate: q.get('end_date') || ''
     }));
   }
 

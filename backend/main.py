@@ -65,6 +65,9 @@ class User(Base):
     hashed_password = Column(String(255))
     role = Column(String(20), default=SELLER_ROLE)
     must_change_password = Column(Boolean, default=True)
+    # Excluir usuario nunca apaga a linha: marca deleted_at e ele perde
+    # acesso, mas o historico de vendas continua apontando pro mesmo username.
+    deleted_at = Column(DateTime, nullable=True)
 
 
 class Product(Base):
@@ -86,6 +89,7 @@ class CategoryCost(Base):
     category = Column(String(100), default="Geral")
     amount = Column(Float)
     event_day = Column(String(40), default="Dia 1")
+    deleted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -96,6 +100,7 @@ class Customer(Base):
     phone = Column(String(30), nullable=True)
     group_name = Column(String(100), nullable=True)
     debt = Column(Float, default=0.0)
+    deleted_at = Column(DateTime, nullable=True)
 
 
 class Sale(Base):
@@ -173,6 +178,7 @@ class Payment(Base):
     username = Column(String(120), nullable=True)
     note = Column(Text, nullable=True)
     client_request_id = Column(String(64), nullable=True, unique=True, index=True)
+    deleted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     customer = relationship("Customer")
@@ -411,7 +417,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     except JWTError:
         raise HTTPException(status_code=401)
 
-    user = db.query(User).filter(User.username == username).first()
+    user = db.query(User).filter(User.username == username, User.deleted_at.is_(None)).first()
     if not user:
         raise HTTPException(status_code=401)
     if not user.role:
@@ -482,6 +488,22 @@ def migrate_schema():
             "UPDATE sales SET event_day = 'Dia 1' WHERE event_day IS NULL OR event_day = ''"
         )
 
+        # Colunas novas (soft-delete + cancelamento de venda). ADD COLUMN IF NOT
+        # EXISTS funciona tanto em SQLite (3.35+) quanto em Postgres.
+        for stmt in (
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+            "ALTER TABLE customers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+            "ALTER TABLE category_costs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+            "ALTER TABLE payments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+            "ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP",
+            "ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_by VARCHAR",
+            "ALTER TABLE sales ADD COLUMN IF NOT EXISTS client_request_id VARCHAR",
+        ):
+            try:
+                conn.exec_driver_sql(stmt)
+            except Exception:
+                pass
+
 
 migrate_schema()
 
@@ -529,7 +551,7 @@ def require_seller_or_admin(u: User = Depends(get_current_user)):
     return u
 
 def ensure_admin_will_remain(db: Session, user: User):
-    admin_count = db.query(User).filter(User.role == ADMIN_ROLE).count()
+    admin_count = db.query(User).filter(User.role == ADMIN_ROLE, User.deleted_at.is_(None)).count()
     if user.role == ADMIN_ROLE and admin_count <= 1:
         raise HTTPException(status_code=400, detail="É preciso manter ao menos um administrador")
 
@@ -603,7 +625,7 @@ async def login(request: Request, db: Session = Depends(get_db)):
     turnstile_token = str(form_data.get("cf-turnstile-response") or form_data.get("turnstile_token") or "")
     verify_turnstile(turnstile_token, request.client.host if request.client else None)
 
-    user = db.query(User).filter(User.username == username).first()
+    user = db.query(User).filter(User.username == username, User.deleted_at.is_(None)).first()
     if not user or not pwd_context.verify(password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Login incorreto")
     return {
@@ -645,7 +667,8 @@ def change_own_password(
 
 @app.get("/users/")
 def list_users(db: Session = Depends(get_db), u: User = Depends(require_admin)):
-    return [serialize_user(user) for user in db.query(User).order_by(User.username).all()]
+    rows = db.query(User).filter(User.deleted_at.is_(None)).order_by(User.username).all()
+    return [serialize_user(user) for user in rows]
 
 @app.post("/users/")
 def create_user(user: UserCreate, db: Session = Depends(get_db), u: User = Depends(require_admin)):
@@ -700,12 +723,15 @@ def delete_user(id: int, db: Session = Depends(get_db), u: User = Depends(requir
     db_user = db.query(User).filter(User.id == id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if db_user.deleted_at:
+        raise HTTPException(status_code=404, detail="Usuário já estava excluído")
     if db_user.id == u.id:
         raise HTTPException(status_code=400, detail="Você não pode excluir o próprio usuário")
     if db_user.role == ADMIN_ROLE:
         ensure_admin_will_remain(db, db_user)
 
-    db.delete(db_user)
+    # Nunca apaga: marca deleted_at, o usuario some das listas e perde acesso.
+    db_user.deleted_at = datetime.utcnow()
     db.commit()
     return {"message": "Usuário excluído"}
 
@@ -947,7 +973,9 @@ async def import_nfe(file: UploadFile = File(...), db: Session = Depends(get_db)
 
 @app.get("/category-costs/")
 def list_category_costs(db: Session = Depends(get_db), u: User = Depends(require_admin)):
-    rows = db.query(CategoryCost).order_by(CategoryCost.created_at.desc(), CategoryCost.id.desc()).all()
+    rows = db.query(CategoryCost).filter(CategoryCost.deleted_at.is_(None)).order_by(
+        CategoryCost.created_at.desc(), CategoryCost.id.desc()
+    ).all()
     return [serialize_category_cost(row) for row in rows]
 
 
@@ -973,7 +1001,9 @@ def delete_category_cost(id: int, db: Session = Depends(get_db), u: User = Depen
     cost = db.query(CategoryCost).filter(CategoryCost.id == id).first()
     if not cost:
         raise HTTPException(status_code=404, detail="Custo não encontrado")
-    db.delete(cost)
+    if cost.deleted_at:
+        raise HTTPException(status_code=404, detail="Custo já estava removido")
+    cost.deleted_at = datetime.utcnow()
     db.commit()
     return {"message": "Custo removido"}
 
@@ -982,7 +1012,8 @@ def delete_category_cost(id: int, db: Session = Depends(get_db), u: User = Depen
 
 @app.get("/customers/")
 def list_customers(db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
-    return [serialize_customer(c) for c in db.query(Customer).order_by(Customer.name).all()]
+    rows = db.query(Customer).filter(Customer.deleted_at.is_(None)).order_by(Customer.name).all()
+    return [serialize_customer(c) for c in rows]
 
 @app.post("/customers/")
 def create_customer(c: CustomerCreate, db: Session = Depends(get_db), u: User = Depends(require_seller_or_admin)):
@@ -1017,9 +1048,12 @@ def delete_customer(id: int, db: Session = Depends(get_db), u: User = Depends(re
     db_c = db.query(Customer).filter(Customer.id == id).first()
     if not db_c:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
+    if db_c.deleted_at:
+        raise HTTPException(status_code=404, detail="Cliente já estava excluído")
     if db_c.debt > 0:
         raise HTTPException(status_code=400, detail="Cliente possui dívida pendente")
-    db.delete(db_c)
+    # Nunca apaga: as compras dele continuam no historico e em relatorio.
+    db_c.deleted_at = datetime.utcnow()
     db.commit()
     return {"message": "Cliente excluído"}
 
@@ -1249,7 +1283,7 @@ def create_sale(sale: SaleCreate, db: Session = Depends(get_db), u: User = Depen
         is_paid = False
 
     cust = db.query(Customer).filter(Customer.id == sale.customer_id).first()
-    if not cust:
+    if not cust or cust.deleted_at:
         raise HTTPException(status_code=404, detail="Cliente não encontrado")
     if not is_paid and cust.name == DEFAULT_CUSTOMER_NAME:
         raise HTTPException(status_code=400, detail="Fiado exige um cliente identificado. Selecione ou cadastre o cliente.")
@@ -1501,15 +1535,6 @@ def sales_dashboard(
     for row in by_day_list:
         row["combined_revenue"] = round(row["revenue"] + row["vouchers_revenue"], 2)
 
-    # Cancelamentos por vendedor original — so existe dado a partir desta correcao
-    cancel_rows = db.query(
-        Sale.seller_username, func.count(Sale.id), func.sum(Sale.total_value)
-    ).filter(Sale.cancelled_at.isnot(None)).group_by(Sale.seller_username).order_by(func.count(Sale.id).desc()).all()
-    cancelled_by_seller = [
-        {"seller": seller or "desconhecido", "count": count, "total": total or 0}
-        for seller, count, total in cancel_rows
-    ]
-
     # Baixas de fiado por quem recebeu
     pay_query = db.query(Payment.username, func.count(Payment.id), func.sum(Payment.amount))
     if start_date:
@@ -1534,7 +1559,6 @@ def sales_dashboard(
             "vouchers_revenue": round(vouchers_total, 2),
             "combined_revenue": round(total_revenue + vouchers_total, 2)
         },
-        "cancelled_by_seller": cancelled_by_seller,
         "payments_by_user": payments_by_user
     }
 

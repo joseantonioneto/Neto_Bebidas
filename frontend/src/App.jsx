@@ -428,6 +428,9 @@ function App() {
   const [reportProduct, setReportProduct] = useState(null);
   const [dashboard, setDashboard] = useState(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
+  const [supplierReport, setSupplierReport] = useState(null);
+  const [loadingSuppliers, setLoadingSuppliers] = useState(false);
+  const [supplierModal, setSupplierModal] = useState({ open: false, supplier: null });
   const [users, setUsers] = useState([]);
   const [reportSummary, setReportSummary] = useState(null);
   const [paymentMethods, setPaymentMethods] = useState(FALLBACK_PAYMENT_METHODS);
@@ -658,6 +661,22 @@ function App() {
     }
   }, [reportStartDate, reportEndDate, reportCategory, reportProduct, showFeedback]);
 
+  // Vendas por fornecedor — so usa o filtro de data (o agrupamento e por
+  // fornecedor, categoria/produto especifico nao se aplica aqui)
+  const fetchSuppliers = useCallback(async () => {
+    setLoadingSuppliers(true);
+    try {
+      const { data } = await api.get('/reports/suppliers', {
+        params: { start_date: reportStartDate || undefined, end_date: reportEndDate || undefined }
+      });
+      setSupplierReport(data);
+    } catch {
+      showFeedback('Não consegui carregar as vendas por fornecedor.', 'error');
+    } finally {
+      setLoadingSuppliers(false);
+    }
+  }, [reportStartDate, reportEndDate, showFeedback]);
+
   // Baixas de fiado — carrega paginado, so com a aba aberta
   const fetchPaymentsPage = useCallback(async (opts = {}) => {
     setLoadingPayments(true);
@@ -728,6 +747,11 @@ function App() {
     if (!token || !isAdmin || tabValue !== 'relatorio') return;
     fetchDashboard();
   }, [token, isAdmin, tabValue, fetchDashboard]);
+
+  useEffect(() => {
+    if (!token || !isAdmin || tabValue !== 'relatorio') return;
+    fetchSuppliers();
+  }, [token, isAdmin, tabValue, fetchSuppliers]);
 
   // Atualiza o estoque em tempo real enquanto a aba Consulta estiver aberta
   useEffect(() => {
@@ -2169,7 +2193,7 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
           <Container maxWidth="lg" sx={{ px: isMobile ? 0 : 2 }}>
             <Box display="flex" justifyContent="space-between" alignItems="center" mb={2} gap={1} flexWrap="wrap">
               <Typography variant="h5">Relatório</Typography>
-              <Button size="small" startIcon={<Refresh />} onClick={fetchDashboard} disabled={loadingDashboard}>
+              <Button size="small" startIcon={<Refresh />} onClick={() => { fetchDashboard(); fetchSuppliers(); }} disabled={loadingDashboard || loadingSuppliers}>
                 Atualizar
               </Button>
             </Box>
@@ -2267,55 +2291,68 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                   </ResponsiveContainer>
                 </Paper>
 
-                <Grid container spacing={2} sx={{ mb: 2 }}>
-                  <Grid size={{ xs: 12, md: 6 }}>
-                    <Paper sx={{ p: 2 }}>
-                      <Typography variant="h6" gutterBottom>Baixas de fiado por vendedor</Typography>
-                      {dashboard.payments_by_user.length === 0 ? (
-                        <Typography variant="body2" color="text.secondary">Nenhuma baixa no período.</Typography>
-                      ) : (
-                        <Table size="small">
-                          <TableHead><TableRow><TableCell>Vendedor</TableCell><TableCell align="center">Baixas</TableCell><TableCell align="right">Total</TableCell></TableRow></TableHead>
-                          <TableBody>
-                            {dashboard.payments_by_user.map((row) => (
-                              <TableRow key={row.username}>
-                                <TableCell>{row.username}</TableCell>
-                                <TableCell align="center">{row.count}</TableCell>
-                                <TableCell align="right">R$ {formatCurrency(row.total)}</TableCell>
-                              </TableRow>
-                            ))}
-                          </TableBody>
-                        </Table>
-                      )}
-                    </Paper>
-                  </Grid>
-                  <Grid size={{ xs: 12, md: 6 }}>
-                    <Paper sx={{ p: 2 }}>
-                      <Typography variant="h6" gutterBottom>Vendas canceladas por vendedor</Typography>
-                      <Alert severity="info" sx={{ mb: 1.5 }}>
-                        Só conta cancelamentos feitos a partir de 07/09 — antes disso a venda cancelada era apagada do banco e não guardava quem tinha vendido.
-                      </Alert>
-                      {dashboard.cancelled_by_seller.length === 0 ? (
-                        <Typography variant="body2" color="text.secondary">Nenhum cancelamento registrado ainda.</Typography>
-                      ) : (
-                        <Table size="small">
-                          <TableHead><TableRow><TableCell>Vendedor</TableCell><TableCell align="center">Canceladas</TableCell><TableCell align="right">Total</TableCell></TableRow></TableHead>
-                          <TableBody>
-                            {dashboard.cancelled_by_seller.map((row) => (
-                              <TableRow key={row.seller}>
-                                <TableCell>{row.seller}</TableCell>
-                                <TableCell align="center">{row.count}</TableCell>
-                                <TableCell align="right">R$ {formatCurrency(row.total)}</TableCell>
-                              </TableRow>
-                            ))}
-                          </TableBody>
-                        </Table>
-                      )}
-                    </Paper>
-                  </Grid>
-                </Grid>
+                <Paper sx={{ p: 2, mb: 2 }}>
+                  <Typography variant="h6" gutterBottom>Baixas de fiado por vendedor</Typography>
+                  {dashboard.payments_by_user.length === 0 ? (
+                    <Typography variant="body2" color="text.secondary">Nenhuma baixa no período.</Typography>
+                  ) : (
+                    <Table size="small">
+                      <TableHead><TableRow><TableCell>Vendedor</TableCell><TableCell align="center">Baixas</TableCell><TableCell align="right">Total</TableCell></TableRow></TableHead>
+                      <TableBody>
+                        {dashboard.payments_by_user.map((row) => (
+                          <TableRow key={row.username}>
+                            <TableCell>{row.username}</TableCell>
+                            <TableCell align="center">{row.count}</TableCell>
+                            <TableCell align="right">R$ {formatCurrency(row.total)}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  )}
+                </Paper>
               </>
             )}
+
+            <Paper sx={{ p: 2, mb: 2 }}>
+              <Typography variant="h6" gutterBottom>Vendas por fornecedor</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+                Extraído do nome do produto ("Descrição - Fornecedor"). Clique numa linha para ver os itens vendidos.
+              </Typography>
+              {loadingSuppliers && <LinearProgress sx={{ mb: 1.5 }} />}
+              {!loadingSuppliers && (!supplierReport || supplierReport.suppliers.length === 0) && (
+                <Typography variant="body2" color="text.secondary">Nenhuma venda com fornecedor identificado no período.</Typography>
+              )}
+              {!loadingSuppliers && supplierReport && supplierReport.suppliers.length > 0 && (
+                <TableContainer sx={{ maxHeight: 400 }}>
+                  <Table size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Fornecedor</TableCell>
+                        <TableCell align="center">Vendas</TableCell>
+                        <TableCell align="center">Unidades</TableCell>
+                        <TableCell align="right">Total</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {supplierReport.suppliers.map((row) => (
+                        <TableRow key={row.supplier} hover sx={{ cursor: 'pointer' }}
+                          onClick={() => setSupplierModal({ open: true, supplier: row })}>
+                          <TableCell sx={{ color: 'primary.main', fontWeight: 'bold' }}>{row.supplier}</TableCell>
+                          <TableCell align="center">{row.sales_count}</TableCell>
+                          <TableCell align="center">{row.quantity}</TableCell>
+                          <TableCell align="right">R$ {formatCurrency(row.revenue)}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              )}
+              {supplierReport && supplierReport.unmatched.sales_count > 0 && (
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                  {supplierReport.unmatched.sales_count} itens vendidos ({supplierReport.unmatched.quantity} un., R$ {formatCurrency(supplierReport.unmatched.revenue)}) são de produtos sem " - Fornecedor" no nome e não entram nessa lista.
+                </Typography>
+              )}
+            </Paper>
 
             <Paper sx={{ p: 2 }}>
               <Typography variant="h6" gutterBottom>Produtos com custo zero</Typography>
@@ -2958,6 +2995,37 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
         <DialogActions>
           <Button onClick={() => setOpenNewClientDialog(false)}>Cancelar</Button>
           <Button onClick={handleCreateCustomer} variant="contained">Salvar</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Itens vendidos de um fornecedor — o que foi vendido, para quem e por quem */}
+      <Dialog open={supplierModal.open} onClose={() => setSupplierModal({ open: false, supplier: null })} fullWidth maxWidth="sm">
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 }}>
+          {supplierModal.supplier?.supplier}
+          {supplierModal.supplier && <Chip label={`R$ ${formatCurrency(supplierModal.supplier.revenue)}`} color="success" size="small" />}
+        </DialogTitle>
+        <DialogContent sx={{ pt: 1 }}>
+          {supplierModal.supplier && (
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+              {supplierModal.supplier.sales_count} vendas · {supplierModal.supplier.quantity} unidades
+            </Typography>
+          )}
+          <List dense sx={{ maxHeight: 420, overflowY: 'auto', bgcolor: '#fafafa', borderRadius: 1, p: 0 }}>
+            {(supplierModal.supplier?.items || []).map((it, idx) => (
+              <ListItem key={`${it.sale_id}-${idx}`} sx={{ display: 'block', borderBottom: '1px solid #eee', py: 1 }}>
+                <Box display="flex" justifyContent="space-between" alignItems="center" gap={1}>
+                  <Typography variant="body2" fontWeight="bold">{it.quantity}x {it.product_name}</Typography>
+                  <Typography variant="body2">R$ {formatCurrency(it.total)}</Typography>
+                </Box>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  {formatDateTimeBR(it.created_at)} · vendido por {it.seller_username} · para {it.customer_name}
+                </Typography>
+              </ListItem>
+            ))}
+          </List>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSupplierModal({ open: false, supplier: null })}>Fechar</Button>
         </DialogActions>
       </Dialog>
 
