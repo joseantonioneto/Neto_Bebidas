@@ -692,8 +692,14 @@ async function deleteUser(db, id, currentUser) {
   return { message: 'Usuario excluido' };
 }
 
-async function listProducts(db) {
-  const rows = await all(db, 'SELECT * FROM products ORDER BY name');
+// A foto vai embutida em base64 e sozinha responde por quase toda a resposta
+// (~2,8 MB no catalogo inteiro). Integracoes externas passam photo=0 e recebem
+// so os dados do produto.
+async function listProducts(db, opts = {}) {
+  const colunas = opts.withPhoto === false
+    ? 'id, name, category, barcode, cost_price, sell_price, stock'
+    : '*';
+  const rows = await all(db, `SELECT ${colunas} FROM products ORDER BY name`);
   return rows.map(serializeProduct);
 }
 
@@ -1847,7 +1853,9 @@ async function handle(request, env, params, ctx = {}) {
   if (resource === 'products') {
     if (!second && request.method === 'GET') {
       requireSellerOrAdmin(currentUser);
-      return json(await listProducts(db));
+      const q = new URL(request.url).searchParams;
+      const semFoto = q.get('photo') === '0' || q.get('photo') === 'false';
+      return json(await listProducts(db, { withPhoto: !semFoto }));
     }
     if (!second && request.method === 'POST') {
       requireSellerOrAdmin(currentUser);
