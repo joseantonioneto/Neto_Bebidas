@@ -759,6 +759,16 @@ function App() {
     }
   };
 
+  const handleCopyReportUrl = async () => {
+    const url = `${window.location.origin}/api/relatorio?token=${createdApiKey.token}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      showFeedback('URL do relatório copiada!', 'success');
+    } catch {
+      showFeedback('Não consegui copiar — selecione e copie manualmente.', 'warning');
+    }
+  };
+
   const handleCopyApiKey = async () => {
     try {
       await navigator.clipboard.writeText(createdApiKey.token);
@@ -3226,13 +3236,23 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
             fullWidth value={createdApiKey?.token || ''} InputProps={{ readOnly: true, sx: { fontFamily: 'monospace' } }}
             onFocus={(e) => e.target.select()}
           />
+          <Typography variant="subtitle2" sx={{ mt: 2.5 }}>URL pronta do relatório</Typography>
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 1 }}>
+            Cole esta URL direto numa conversa com uma IA — ela lê o JSON sem precisar de cabeçalho.
+          </Typography>
+          <TextField
+            fullWidth size="small" value={createdApiKey ? `${window.location.origin}/api/relatorio?token=${createdApiKey.token}` : ''}
+            InputProps={{ readOnly: true, sx: { fontFamily: 'monospace', fontSize: 12 } }}
+            onFocus={(e) => e.target.select()}
+          />
           <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1.5 }}>
-            Manda para o colega usar assim: <code>Authorization: Bearer {'{token}'}</code> em qualquer rota GET da API
-            (ex.: <code>https://mercadinho-caminhar.pages.dev/api/products/</code>). Não escreve nada — só lê.
+            Pela URL só sai relatório agregado (produto, quantidade e valor) — nada de nome, telefone ou dívida
+            de cliente. Para leitura completa, use <code>Authorization: Bearer {'{token}'}</code> no cabeçalho.
           </Typography>
         </DialogContent>
         <DialogActions>
-          <Button onClick={handleCopyApiKey} startIcon={<ContentCopy />}>Copiar</Button>
+          <Button onClick={handleCopyReportUrl} startIcon={<ContentCopy />}>Copiar URL</Button>
+          <Button onClick={handleCopyApiKey} startIcon={<ContentCopy />}>Copiar token</Button>
           <Button onClick={() => setCreatedApiKey(null)} variant="contained">Fechar</Button>
         </DialogActions>
       </Dialog>

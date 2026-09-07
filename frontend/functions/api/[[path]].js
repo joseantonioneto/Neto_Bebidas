@@ -25,6 +25,10 @@ const ADMIN_ROLE = 'admin';
 const SELLER_ROLE = 'vendedor';
 const VALID_ROLES = new Set([ADMIN_ROLE, SELLER_ROLE]);
 const DEFAULT_CUSTOMER_NAME = 'Consumidor Final';
+// Rotas liberadas quando o token vem na URL (?token=): so agregado, sem
+// nome/telefone/divida de cliente.
+const ROTAS_TOKEN_NA_URL = new Set(['relatorio', 'reports', 'products', 'payment-methods', 'health']);
+
 const DEFAULT_SECRET = 'netobebidas-chave-secreta-mude-isso-em-producao';
 const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 
@@ -405,15 +409,20 @@ async function getAllSaleItems(db) {
 async function getCurrentUser(request, env, db) {
   const auth = request.headers.get('authorization') || '';
   const match = auth.match(/^Bearer\s+(.+)$/i);
-  if (!match) throw new HttpError(401, 'Nao autenticado');
-  const token = match[1];
+  // Sem cabecalho, aceita ?token=mck_... na URL — e o unico jeito de um
+  // cliente que so faz GET simples (ex.: o app do Claude) se autenticar.
+  // Vale so para chave de API; login de usuario continua exigindo o cabecalho.
+  const tokenNaUrl = new URL(request.url).searchParams.get('token') || '';
+  const token = match ? match[1] : tokenNaUrl;
+  if (!token) throw new HttpError(401, 'token ausente');
+  if (!match && !token.startsWith('mck_')) throw new HttpError(401, 'token invalido');
 
   // Chave de API (integracao externa): token comeca com "mck_", nao e JWT.
   // So pode ler (GET) — a checagem fica logo no inicio do handle().
   if (token.startsWith('mck_')) {
     const hash = await sha256Hex(token);
     const key = await first(db, 'SELECT * FROM api_keys WHERE token_hash = ? AND deleted_at IS NULL', hash);
-    if (!key) throw new HttpError(401, 'Chave de API invalida ou revogada');
+    if (!key) throw new HttpError(401, 'token invalido');
     await run(db, 'UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?', key.id);
     return {
       id: `api:${key.id}`,
@@ -421,6 +430,7 @@ async function getCurrentUser(request, env, db) {
       role: ADMIN_ROLE,
       must_change_password: false,
       isApiKey: true,
+      apiKeyFromUrl: !match,
       apiKeyId: key.id
     };
   }
@@ -1750,6 +1760,169 @@ async function supplierSales(db, opts = {}) {
   };
 }
 
+// Relatorio consolidado numa unica chamada, para integracao externa.
+// De proposito NAO traz nome/telefone de cliente — so produto, quantidade e
+// valor. O fiado aparece apenas como total agregado.
+async function relatorioConsolidado(db, opts = {}) {
+  const { startDate, endDate } = opts;
+
+  const clauses = ['s.cancelled_at IS NULL'];
+  const values = [];
+  if (startDate) {
+    clauses.push('datetime(s.created_at) >= datetime(?)');
+    values.push(startDate);
+  }
+  if (endDate) {
+    clauses.push('datetime(s.created_at) <= datetime(?)');
+    values.push(endDate.length === 10 ? `${endDate} 23:59:59` : endDate);
+  }
+
+  const vendas = await all(db, `
+    SELECT s.id, s.total_value, s.is_paid, s.payment_method, s.seller_username, s.created_at, s.event_day
+    FROM sales s WHERE ${clauses.join(' AND ')}
+  `, ...values);
+  const itensPorVenda = await getAllSaleItems(db);
+
+  const porForma = {};
+  const porDia = {};
+  const porVendedor = {};
+  let faturamento = 0;
+  let fiadoNoPeriodo = 0;
+  let custoProdutos = 0;
+  let unidades = 0;
+
+  for (const v of vendas) {
+    const total = numberValue(v.total_value);
+    faturamento += total;
+    if (!v.is_paid) fiadoNoPeriodo += total;
+
+    const forma = v.payment_method || (v.is_paid ? 'dinheiro' : 'fiado');
+    porForma[forma] ||= { forma, rotulo: PAYMENT_METHODS[forma] || forma, vendas: 0, total: 0 };
+    porForma[forma].vendas += 1;
+    porForma[forma].total += total;
+
+    const dia = sortableDate(v.created_at);
+    porDia[dia] ||= { data: dia, vendas: 0, total: 0, unidades: 0 };
+    porDia[dia].vendas += 1;
+    porDia[dia].total += total;
+
+    const vendedor = v.seller_username || 'desconhecido';
+    porVendedor[vendedor] ||= { vendedor, vendas: 0, total: 0 };
+    porVendedor[vendedor].vendas += 1;
+    porVendedor[vendedor].total += total;
+
+    for (const item of (itensPorVenda.get(v.id) || [])) {
+      custoProdutos += item.quantity * item.unit_cost_price;
+      unidades += item.quantity;
+      porDia[dia].unidades += item.quantity;
+    }
+  }
+
+  // Pre-venda (vouchers): o dinheiro entra na venda do combo, nao na retirada
+  const voucherClauses = ["status != 'cancelado'"];
+  const voucherValues = [];
+  if (startDate) {
+    voucherClauses.push('datetime(created_at) >= datetime(?)');
+    voucherValues.push(startDate);
+  }
+  if (endDate) {
+    voucherClauses.push('datetime(created_at) <= datetime(?)');
+    voucherValues.push(endDate.length === 10 ? `${endDate} 23:59:59` : endDate);
+  }
+  const vouchers = await all(db, `
+    SELECT quantity, total_value, status FROM vouchers WHERE ${voucherClauses.join(' AND ')}
+  `, ...voucherValues);
+  let preVendaTotal = 0;
+  let combosVendidos = 0;
+  let combosRetirados = 0;
+  for (const v of vouchers) {
+    preVendaTotal += numberValue(v.total_value);
+    combosVendidos += intValue(v.quantity);
+    if (v.status === 'retirado') combosRetirados += intValue(v.quantity);
+  }
+
+  // Fiado em aberto: so o agregado, sem identificar ninguem
+  const fiado = await first(db, `
+    SELECT COUNT(*) clientes, COALESCE(SUM(debt), 0) total
+    FROM customers WHERE debt > 0 AND deleted_at IS NULL
+  `);
+
+  const custosSetor = await listCategoryCosts(db, { startDate, endDate });
+  const custoIndireto = custosSetor.reduce((soma, c) => soma + numberValue(c.amount), 0);
+
+  const fornecedores = await supplierSales(db, { startDate, endDate });
+  const produtos = [];
+  for (const f of fornecedores.suppliers) {
+    for (const prod of f.products) {
+      produtos.push({
+        produto: prod.name,
+        fornecedor: f.supplier,
+        entrada: prod.entrada,
+        vendido: prod.quantity,
+        estoque: prod.stock,
+        faturamento: prod.revenue,
+        custo: prod.cost,
+        lucro: prod.profit
+      });
+    }
+  }
+  produtos.sort((a, b) => b.faturamento - a.faturamento);
+
+  const round2 = (n) => Number(n.toFixed(2));
+
+  return {
+    gerado_em: new Date().toISOString(),
+    periodo: { de: startDate || null, ate: endDate || null },
+    observacao: 'A entrada e deduzida (estoque atual + vendido): o sistema nao registra entrada de mercadoria. Nao ha dados pessoais de clientes neste relatorio.',
+    totais: {
+      vendas: vendas.length,
+      unidades_vendidas: unidades,
+      faturamento_vendas: round2(faturamento),
+      faturamento_pre_venda: round2(preVendaTotal),
+      faturamento_total: round2(faturamento + preVendaTotal),
+      recebido: round2(faturamento - fiadoNoPeriodo),
+      fiado_no_periodo: round2(fiadoNoPeriodo),
+      custo_produtos: round2(custoProdutos),
+      custo_setores: round2(custoIndireto),
+      lucro_estimado: round2(faturamento - custoProdutos - custoIndireto)
+    },
+    fiado_em_aberto: {
+      clientes: intValue(fiado?.clientes),
+      total_a_receber: round2(numberValue(fiado?.total))
+    },
+    pre_venda: {
+      vouchers: vouchers.length,
+      combos_vendidos: combosVendidos,
+      combos_retirados: combosRetirados,
+      combos_pendentes: combosVendidos - combosRetirados,
+      total: round2(preVendaTotal)
+    },
+    por_forma_pagamento: Object.values(porForma)
+      .map((f) => ({ ...f, total: round2(f.total) }))
+      .sort((a, b) => b.total - a.total),
+    por_dia: Object.values(porDia)
+      .map((d) => ({ ...d, total: round2(d.total) }))
+      .sort((a, b) => a.data.localeCompare(b.data)),
+    por_vendedor: Object.values(porVendedor)
+      .map((v) => ({ ...v, total: round2(v.total) }))
+      .sort((a, b) => b.total - a.total),
+    por_fornecedor: fornecedores.suppliers.map((f) => ({
+      fornecedor: f.supplier,
+      produtos: f.products_count,
+      entrada: f.entrada,
+      vendido: f.quantity,
+      estoque: f.stock,
+      faturamento: f.revenue,
+      custo: f.cost,
+      lucro: f.profit
+    })),
+    custos_por_setor: custosSetor.map((c) => ({
+      descricao: c.description, setor: c.category, valor: numberValue(c.amount), data: c.created_at
+    })),
+    produtos
+  };
+}
+
 async function handle(request, env, params, ctx = {}) {
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: json({}).headers });
 
@@ -1789,6 +1962,13 @@ async function handle(request, env, params, ctx = {}) {
     }
     if (resource === 'users' || resource === 'api-keys') {
       throw new HttpError(403, 'Rota nao disponivel para chave de API');
+    }
+    // Token na URL vaza facil (log de servidor, historico, referrer), entao
+    // por esse caminho so liberamos o que nao tem dado pessoal: relatorios
+    // agregados e catalogo de produtos. Com o token no cabecalho, a leitura
+    // continua completa.
+    if (currentUser.apiKeyFromUrl && !ROTAS_TOKEN_NA_URL.has(resource)) {
+      throw new HttpError(403, 'Com o token na URL so da para ler relatorio agregado. Use /api/relatorio (ou mande o token no cabecalho Authorization).');
     }
   }
 
@@ -1971,6 +2151,15 @@ async function handle(request, env, params, ctx = {}) {
       endDate: q.get('end_date') || '',
       category: q.get('category') || '',
       productId: intValue(q.get('product_id')) || 0
+    }));
+  }
+
+  if (resource === 'relatorio' && request.method === 'GET') {
+    requireAdmin(currentUser);
+    const q = new URL(request.url).searchParams;
+    return json(await relatorioConsolidado(db, {
+      startDate: q.get('de') || q.get('start_date') || '',
+      endDate: q.get('ate') || q.get('end_date') || ''
     }));
   }
 
@@ -2255,10 +2444,11 @@ export async function onRequest({ request, env, params }) {
   try {
     response = await handle(request, env, params, ctx);
   } catch (error) {
-    if (error instanceof HttpError) response = json({ detail: error.detail }, error.status);
+    // "detail" e o que o app usa; "erro" e alias para integracoes externas
+    if (error instanceof HttpError) response = json({ detail: error.detail, erro: error.detail }, error.status);
     else {
       console.error(error);
-      response = json({ detail: 'Erro interno' }, 500);
+      response = json({ detail: 'Erro interno', erro: 'Erro interno' }, 500);
     }
   }
 
