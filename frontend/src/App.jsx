@@ -18,7 +18,7 @@ import {
   AdminPanelSettings, Remove, Download, PointOfSale, QrCodeScanner,
   CameraAlt, UploadFile, Close, People, CloudUpload,
   PhotoCamera, ContentCopy, ManageSearch, QrCode2, CheckCircle, AccessTime,
-  ConfirmationNumber, Share, Fastfood, ReceiptLong, Refresh, PriceCheck, QueryStats
+  ConfirmationNumber, Share, Fastfood, ReceiptLong, Refresh, PriceCheck, QueryStats, VpnKey
 } from '@mui/icons-material';
 
 import QRCode from 'qrcode';
@@ -504,6 +504,13 @@ function App() {
   const [paymentsQuery, setPaymentsQuery] = useState('');
   const [loadingPayments, setLoadingPayments] = useState(false);
   const [cancellingPaymentId, setCancellingPaymentId] = useState(null);
+  // Chaves de API (integracoes externas somente-leitura)
+  const [apiKeys, setApiKeys] = useState([]);
+  const [loadingApiKeys, setLoadingApiKeys] = useState(false);
+  const [openCreateApiKeyDialog, setOpenCreateApiKeyDialog] = useState(false);
+  const [newApiKeyName, setNewApiKeyName] = useState('');
+  const [createdApiKey, setCreatedApiKey] = useState(null); // { name, token } — aparece so uma vez
+  const [revokingApiKeyId, setRevokingApiKeyId] = useState(null);
 
   const [openUserDialog, setOpenUserDialog] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
@@ -712,6 +719,55 @@ function App() {
     }
   }, [paymentsPerPage, paymentsPage, paymentsQuery, showFeedback]);
 
+  // Chaves de API — carrega so na aba Usuarios (admin)
+  const fetchApiKeys = useCallback(async () => {
+    setLoadingApiKeys(true);
+    try {
+      const { data } = await api.get('/api-keys');
+      setApiKeys(data || []);
+    } catch {
+      showFeedback('Não consegui carregar as chaves de API.', 'error');
+    } finally {
+      setLoadingApiKeys(false);
+    }
+  }, [showFeedback]);
+
+  const handleCreateApiKey = async () => {
+    if (!newApiKeyName.trim()) return showFeedback('Dê um nome para a chave.', 'warning');
+    try {
+      const { data } = await api.post('/api-keys', { name: newApiKeyName.trim() });
+      setCreatedApiKey({ name: data.name, token: data.token });
+      setOpenCreateApiKeyDialog(false);
+      setNewApiKeyName('');
+      fetchApiKeys();
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao criar chave', 'error');
+    }
+  };
+
+  const handleRevokeApiKey = async (key) => {
+    if (!window.confirm(`Revogar a chave "${key.name}"? Quem estiver usando esse token perde o acesso na hora.`)) return;
+    setRevokingApiKeyId(key.id);
+    try {
+      await api.post(`/api-keys/${key.id}/revoke`);
+      setApiKeys((prev) => prev.filter((k) => k.id !== key.id));
+      showFeedback('Chave revogada.', 'success');
+    } catch (error) {
+      showFeedback(error.response?.data?.detail || 'Erro ao revogar chave', 'error');
+    } finally {
+      setRevokingApiKeyId(null);
+    }
+  };
+
+  const handleCopyApiKey = async () => {
+    try {
+      await navigator.clipboard.writeText(createdApiKey.token);
+      showFeedback('Token copiado!', 'success');
+    } catch {
+      showFeedback('Não consegui copiar — selecione e copie manualmente.', 'warning');
+    }
+  };
+
   const addToCart = useCallback((p) => {
     if (p.stock <= 0) return showFeedback('Sem estoque!', 'warning');
     setCart(prev => {
@@ -755,6 +811,12 @@ function App() {
     const timeoutId = window.setTimeout(() => { fetchPaymentsPage(); }, paymentsQuery ? 350 : 0);
     return () => window.clearTimeout(timeoutId);
   }, [token, isAdmin, tabValue, paymentsQuery, fetchPaymentsPage]);
+
+  // Chaves de API: so busca com a aba Usuarios aberta
+  useEffect(() => {
+    if (!token || !isAdmin || tabValue !== 'usuarios') return;
+    fetchApiKeys();
+  }, [token, isAdmin, tabValue, fetchApiKeys]);
 
   // Relatorio: so busca com a aba aberta, refaz quando um filtro muda
   useEffect(() => {
@@ -3091,9 +3153,89 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                 </TableBody>
               </Table>
             </TableContainer>
+
+            <Box display="flex" justifyContent="space-between" alignItems="center" mt={4} mb={2}>
+              <Box>
+                <Typography variant="h5">Chaves de API</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Acesso somente leitura (GET) para integrações externas — dê o token para quem for integrar.
+                </Typography>
+              </Box>
+              <Button variant="contained" onClick={() => setOpenCreateApiKeyDialog(true)} startIcon={<VpnKey />}>Nova</Button>
+            </Box>
+            {loadingApiKeys && <LinearProgress sx={{ mb: 1 }} />}
+            <TableContainer component={Paper}>
+              <Table size="small">
+                <TableHead sx={{ bgcolor: '#eee' }}>
+                  <TableRow>
+                    <TableCell>Nome</TableCell>
+                    <TableCell>Token</TableCell>
+                    {!isMobile && <TableCell>Criada por</TableCell>}
+                    {!isMobile && <TableCell>Último uso</TableCell>}
+                    <TableCell align="center">Ação</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {apiKeys.map((key) => (
+                    <TableRow key={key.id}>
+                      <TableCell>{key.name}</TableCell>
+                      <TableCell><Typography variant="body2" fontFamily="monospace">{key.token_preview}</Typography></TableCell>
+                      {!isMobile && <TableCell>{key.created_by || '—'}</TableCell>}
+                      {!isMobile && <TableCell>{key.last_used_at ? formatDateTimeBR(key.last_used_at) : 'nunca'}</TableCell>}
+                      <TableCell align="center">
+                        <IconButton size="small" color="error" disabled={revokingApiKeyId === key.id} onClick={() => handleRevokeApiKey(key)}>
+                          <Delete fontSize="small" />
+                        </IconButton>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!loadingApiKeys && apiKeys.length === 0 && (
+                    <TableRow><TableCell colSpan={isMobile ? 3 : 5} align="center" sx={{ py: 3, color: 'text.secondary' }}>Nenhuma chave criada ainda.</TableCell></TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
           </Container>
         )}
       </Container>
+
+      {/* Criar chave de API */}
+      <Dialog open={openCreateApiKeyDialog} onClose={() => setOpenCreateApiKeyDialog(false)} fullWidth maxWidth="xs">
+        <DialogTitle>Nova chave de API</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Dê um nome para identificar quem vai usar (ex.: nome do colega ou da integração).
+          </Typography>
+          <TextField autoFocus fullWidth label="Nome" value={newApiKeyName} onChange={(e) => setNewApiKeyName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleCreateApiKey()} />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenCreateApiKeyDialog(false)}>Cancelar</Button>
+          <Button onClick={handleCreateApiKey} variant="contained">Criar</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Token recem-criado — aparece uma unica vez */}
+      <Dialog open={!!createdApiKey} onClose={() => setCreatedApiKey(null)} fullWidth maxWidth="sm">
+        <DialogTitle>Chave "{createdApiKey?.name}" criada</DialogTitle>
+        <DialogContent>
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Copie agora — por segurança, esse token não aparece de novo. Se perder, revogue e crie outro.
+          </Alert>
+          <TextField
+            fullWidth value={createdApiKey?.token || ''} InputProps={{ readOnly: true, sx: { fontFamily: 'monospace' } }}
+            onFocus={(e) => e.target.select()}
+          />
+          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1.5 }}>
+            Manda para o colega usar assim: <code>Authorization: Bearer {'{token}'}</code> em qualquer rota GET da API
+            (ex.: <code>https://mercadinho-caminhar.pages.dev/api/products/</code>). Não escreve nada — só lê.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCopyApiKey} startIcon={<ContentCopy />}>Copiar</Button>
+          <Button onClick={() => setCreatedApiKey(null)} variant="contained">Fechar</Button>
+        </DialogActions>
+      </Dialog>
 
       {/* --- MOBILE: Bottom Nav + FABs --- */}
       {isMobile && (

@@ -164,6 +164,18 @@ function base64UrlToBytes(value) {
   return bytes;
 }
 
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(text));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function generateApiKeyToken() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `mck_${hex}`;
+}
+
 async function hmacKey(secret) {
   return crypto.subtle.importKey(
     'raw',
@@ -394,11 +406,77 @@ async function getCurrentUser(request, env, db) {
   const auth = request.headers.get('authorization') || '';
   const match = auth.match(/^Bearer\s+(.+)$/i);
   if (!match) throw new HttpError(401, 'Nao autenticado');
-  const payload = await verifyAccessToken(match[1], env);
+  const token = match[1];
+
+  // Chave de API (integracao externa): token comeca com "mck_", nao e JWT.
+  // So pode ler (GET) — a checagem fica logo no inicio do handle().
+  if (token.startsWith('mck_')) {
+    const hash = await sha256Hex(token);
+    const key = await first(db, 'SELECT * FROM api_keys WHERE token_hash = ? AND deleted_at IS NULL', hash);
+    if (!key) throw new HttpError(401, 'Chave de API invalida ou revogada');
+    await run(db, 'UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?', key.id);
+    return {
+      id: `api:${key.id}`,
+      username: `api:${key.name}`,
+      role: ADMIN_ROLE,
+      must_change_password: false,
+      isApiKey: true,
+      apiKeyId: key.id
+    };
+  }
+
+  const payload = await verifyAccessToken(token, env);
   const user = await first(db, 'SELECT * FROM users WHERE username = ? AND deleted_at IS NULL', payload.sub);
   if (!user) throw new HttpError(401, 'Usuario nao encontrado');
   if (!user.role) user.role = ADMIN_ROLE;
   return user;
+}
+
+function serializeApiKey(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    token_preview: row.token_preview,
+    created_by: row.created_by,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at || null
+  };
+}
+
+async function listApiKeys(db) {
+  const rows = await all(db, 'SELECT * FROM api_keys WHERE deleted_at IS NULL ORDER BY created_at DESC');
+  return rows.map(serializeApiKey);
+}
+
+async function createApiKey(request, db, user) {
+  const data = await readJson(request);
+  const name = String(data.name || '').trim();
+  if (!name) throw new HttpError(400, 'De um nome para identificar essa chave (ex.: nome do colega/integracao)');
+
+  const token = generateApiKeyToken();
+  const tokenHash = await sha256Hex(token);
+  const preview = `...${token.slice(-6)}`;
+
+  const result = await run(db, `
+    INSERT INTO api_keys (name, token_hash, token_preview, created_by, created_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+  `, name, tokenHash, preview, user.username);
+
+  const row = await first(db, 'SELECT * FROM api_keys WHERE id = ?', lastRowId(result));
+  return {
+    ...serializeApiKey(row),
+    // Unica vez que o token completo aparece — o front precisa mostrar e
+    // avisar para copiar agora, pois nao da para recuperar depois.
+    token
+  };
+}
+
+async function revokeApiKey(db, id) {
+  const key = await first(db, 'SELECT * FROM api_keys WHERE id = ?', id);
+  if (!key) throw new HttpError(404, 'Chave nao encontrada');
+  if (key.deleted_at) throw new HttpError(404, 'Chave ja estava revogada');
+  await run(db, 'UPDATE api_keys SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?', id);
+  return { message: 'Chave revogada' };
 }
 
 function requireAdmin(user) {
@@ -1646,6 +1724,17 @@ async function handle(request, env, params, ctx = {}) {
   const currentUser = await getCurrentUser(request, env, db);
   ctx.user = currentUser;
 
+  // Chave de API: nunca escreve, e fica de fora da gestao de usuarios/chaves
+  // (so quem loga com usuario e senha pode criar/revogar chaves).
+  if (currentUser.isApiKey) {
+    if (request.method !== 'GET') {
+      throw new HttpError(403, 'Esta chave de API e somente leitura');
+    }
+    if (resource === 'users' || resource === 'api-keys') {
+      throw new HttpError(403, 'Rota nao disponivel para chave de API');
+    }
+  }
+
   if (resource === 'me' && request.method === 'GET') return json(serializeUser(currentUser));
 
   if (resource === 'users' && second === 'me' && third === 'password' && request.method === 'POST') {
@@ -1682,6 +1771,13 @@ async function handle(request, env, params, ctx = {}) {
       requireAdmin(currentUser);
       return json(await cancelVoucher(db, intValue(second)));
     }
+  }
+
+  if (resource === 'api-keys') {
+    requireAdmin(currentUser);
+    if (!second && request.method === 'GET') return json(await listApiKeys(db));
+    if (!second && request.method === 'POST') return json(await createApiKey(request, db, currentUser));
+    if (second && third === 'revoke' && request.method === 'POST') return json(await revokeApiKey(db, intValue(second)));
   }
 
   if (resource === 'users') {
@@ -2042,6 +2138,8 @@ function describeAction(method, parts) {
   if (r === 'vouchers' && M === 'POST' && !s) return 'Criou pre-venda';
   if (r === 'vouchers' && t === 'redeem') return 'Deu baixa em voucher';
   if (r === 'vouchers' && t === 'cancel') return 'Cancelou voucher';
+  if (r === 'api-keys' && t === 'revoke') return 'Revogou chave de API';
+  if (r === 'api-keys' && M === 'POST') return 'Criou chave de API';
   if (r === 'users' && M === 'POST') return 'Criou usuario';
   if (r === 'users' && M === 'PUT') return 'Editou usuario';
   if (r === 'users' && M === 'DELETE') return 'Excluiu usuario';
