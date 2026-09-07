@@ -176,6 +176,10 @@ const normalizeText = (value) => String(value ?? '')
   .toLowerCase()
   .trim();
 
+// Mesma convencao usada no cadastro em lote e no relatorio por fornecedor:
+// "Descrição - Fornecedor". Serve para achar quem ainda esta sem essa marcação.
+const hasSupplierSuffix = (name) => String(name || '').includes(' - ');
+
 // Id unico por carrinho, usado para o servidor descartar reenvios da mesma venda
 const newRequestId = () => (
   window.crypto?.randomUUID
@@ -444,6 +448,7 @@ function App() {
   const [stockCategoryFilter, setStockCategoryFilter] = useState('');
   const [estoqueQuery, setEstoqueQuery] = useState('');
   const [estoqueCategoryFilter, setEstoqueCategoryFilter] = useState('');
+  const [estoqueSemFornecedor, setEstoqueSemFornecedor] = useState(false);
 
   // Pré-venda (vouchers)
   const [vouchers, setVouchers] = useState([]);
@@ -753,6 +758,13 @@ function App() {
     fetchSuppliers();
   }, [token, isAdmin, tabValue, fetchSuppliers]);
 
+  // Tambem carrega o resumo (traz a quantidade vendida por produto, usada na
+  // lista de "Produtos com custo zero")
+  useEffect(() => {
+    if (!token || !isAdmin || tabValue !== 'relatorio') return;
+    fetchSummary();
+  }, [token, isAdmin, tabValue, fetchSummary]);
+
   // Atualiza o estoque em tempo real enquanto a aba Consulta estiver aberta
   useEffect(() => {
     if (!token || tabValue !== 'consulta') return undefined;
@@ -949,6 +961,17 @@ function App() {
   const zeroCostProducts = products
     .filter((p) => !Number(p.cost_price))
     .sort((a, b) => a.name.localeCompare(b.name));
+
+  // Produtos sem "- Fornecedor" no nome — ficam de fora do relatorio por fornecedor
+  const semFornecedorCount = products.filter((p) => !hasSupplierSuffix(p.name)).length;
+
+  // Quantidade vendida por produto (vem do /reports/summary) — usada na lista
+  // de produtos com custo zero, para ver se e um item parado ou um que ja vendeu bastante
+  const soldQtyByProduct = useMemo(() => {
+    const map = {};
+    (reportSummary?.top_products || []).forEach((tp) => { map[tp.product_id] = tp.quantity; });
+    return map;
+  }, [reportSummary]);
 
   const filteredCustomers = customers
     .filter(c => normalizeText(c.name).includes(normalizeText(searchTerm)))
@@ -2370,23 +2393,32 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                         <TableCell>Categoria</TableCell>
                         <TableCell align="right">Venda</TableCell>
                         <TableCell align="center">Estoque</TableCell>
+                        <TableCell align="center">Vendido</TableCell>
                         <TableCell align="center">Ação</TableCell>
                       </TableRow>
                     </TableHead>
                     <TableBody>
-                      {zeroCostProducts.map((p) => (
-                        <TableRow key={p.id} hover>
-                          <TableCell>{p.name}</TableCell>
-                          <TableCell>{p.category || 'Geral'}</TableCell>
-                          <TableCell align="right">R$ {formatCurrency(p.sell_price)}</TableCell>
-                          <TableCell align="center">{p.stock}</TableCell>
-                          <TableCell align="center">
-                            <IconButton size="small" onClick={() => { setEditProductData({ ...p, category: p.category || 'Geral', barcode: p.barcode || '' }); setOpenEditProductDialog(true); }}>
-                              <Edit fontSize="small" />
-                            </IconButton>
-                          </TableCell>
-                        </TableRow>
-                      ))}
+                      {zeroCostProducts.map((p) => {
+                        const vendido = soldQtyByProduct[p.id] || 0;
+                        return (
+                          <TableRow key={p.id} hover>
+                            <TableCell>{p.name}</TableCell>
+                            <TableCell>{p.category || 'Geral'}</TableCell>
+                            <TableCell align="right">R$ {formatCurrency(p.sell_price)}</TableCell>
+                            <TableCell align="center">{p.stock}</TableCell>
+                            <TableCell align="center">
+                              {vendido > 0
+                                ? <Chip label={vendido} size="small" color="warning" variant="outlined" />
+                                : <Typography variant="body2" color="text.secondary">0</Typography>}
+                            </TableCell>
+                            <TableCell align="center">
+                              <IconButton size="small" onClick={() => { setEditProductData({ ...p, category: p.category || 'Geral', barcode: p.barcode || '' }); setOpenEditProductDialog(true); }}>
+                                <Edit fontSize="small" />
+                              </IconButton>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </TableContainer>
@@ -2849,11 +2881,29 @@ ${labels.map(l => `  <div class="label"><div class="name">${l.name.replace(/&/g,
                   </Box>
                 );
               })()}
+              {isAdmin && (
+                <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
+                  <Typography variant="caption" color="text.secondary">Fornecedor:</Typography>
+                  <Chip
+                    label={`Sem "- Fornecedor" no nome (${semFornecedorCount})`}
+                    size="small" clickable
+                    color={estoqueSemFornecedor ? 'warning' : 'default'}
+                    variant={estoqueSemFornecedor ? 'filled' : 'outlined'}
+                    onClick={() => setEstoqueSemFornecedor((v) => !v)}
+                  />
+                  {estoqueSemFornecedor && (
+                    <Typography variant="caption" color="text.secondary">
+                      Edite o nome do produto e acrescente " - Fornecedor" no final para ele entrar no relatório.
+                    </Typography>
+                  )}
+                </Box>
+              )}
             </Paper>
             {(() => {
               const term = normalizeText(estoqueQuery);
               const filteredEstoque = products
                 .filter((p) => !estoqueCategoryFilter || (p.category || 'Geral') === estoqueCategoryFilter)
+                .filter((p) => !estoqueSemFornecedor || !hasSupplierSuffix(p.name))
                 .filter((p) => !term || normalizeText(p.name).includes(term) || normalizeText(p.category).includes(term) || normalizeText(p.barcode).includes(term));
               return (
             <TableContainer component={Paper}>
